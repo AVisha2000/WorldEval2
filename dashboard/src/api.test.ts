@@ -406,6 +406,42 @@ describe("Demo trio series", () => {
   })
 })
 
+describe("Live Labyrinth Run", () => {
+  it("reserves the full 150-turn budget for each private racer", async () => {
+    const fetch = vi.fn(async () =>
+      response({
+        episode_id: "ep_live_labyrinth_test",
+        task_id: "trio-maze-race-v1",
+        state: "queued",
+        entrants: [],
+        video: { state: "unavailable" },
+      })
+    )
+    vi.stubGlobal("fetch", fetch)
+
+    await createRun({
+      ...scriptedDemoSetup,
+      controllerMode: "live_provider",
+      mode: "trio",
+      apiKey: "session-only-test-key",
+      opponentProvider: "openai",
+      opponentModel: "gpt-5.6-terra",
+      thirdModel: "gpt-5.6-luna",
+    })
+
+    expect(fetch.mock.calls[0]?.[0]).toBe("/api/embodiment/maze-races")
+    const payload = JSON.parse(
+      String((fetch.mock.calls[0] as unknown as [unknown, RequestInit])[1].body)
+    )
+    expect(payload.max_provider_calls).toBe(450)
+    expect(payload.entrants).toEqual([
+      { display_name: "Sol", model: "gpt-5.6-sol" },
+      { display_name: "Terra", model: "gpt-5.6-terra" },
+      { display_name: "Luna", model: "gpt-5.6-luna" },
+    ])
+  })
+})
+
 describe("Demo paired series", () => {
   it("keeps a completed series successful while its native replay is preparing", async () => {
     const fetch = vi.fn(async (input: RequestInfo | URL) => {

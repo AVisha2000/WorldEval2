@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
+from .episode_memory import EpisodeMemory
 from .labyrinth_run import (
     HEADINGS,
     LANDMARKS,
@@ -35,11 +36,18 @@ from .scratchpad import EpisodeScratchpad, ScratchpadError
 
 LIVE_TASK_ID = "trio-maze-race-v1"
 LIVE_REPLAY_SCHEMA = "worldarena/live-labyrinth-run-replay/1"
-MAX_LIVE_PROVIDER_CALLS = 180
+MAX_LIVE_PROVIDER_CALLS = 450
 _PROVIDER_TIMEOUT_NS = 45 * 1_000_000_000
 _SYSTEM_PROMPT = (
     "You control one racer in a private maze lane. Return exactly the MazeTaskPlan JSON object. "
-    "Choose only a currently visible relative passage or wait."
+    "Use only the current observation, your private scratchpad, and navigation_memory. "
+    "navigation_memory is an authoritative episode-local map derived only from your prior visible "
+    "passages and accepted moves. Its cells are [x,y,open_mask,traversed_mask,visits,landmark], "
+    "where direction bits are N=1,E=2,S=4,W=8. Navigate systematically: prefer a currently "
+    "visible passage listed in navigation_memory.current.untried; otherwise use "
+    "navigation_memory.current.backtrack. Do not wait when either is available. Choose only a "
+    "currently visible relative passage or wait. scratchpad_update is an optional full-replacement "
+    "private note and cannot change navigation_memory."
 )
 _PLAN_SCHEMA = {
     "type": "object",
@@ -63,7 +71,15 @@ _PLAN_SCHEMA = {
 }
 _PLAN_SCHEMA_JSON = canonical_json_bytes(_PLAN_SCHEMA)
 _PROTECTED_TERMS = frozenset(
-    ("scratchpad", "raw_output", "credential", "prompt", "chain_of_thought")
+    (
+        "scratchpad",
+        "raw_output",
+        "credential",
+        "prompt",
+        "chain_of_thought",
+        "navigation_memory",
+        "episode_memory",
+    )
 )
 
 
@@ -143,6 +159,142 @@ class _Racer:
     finished_tick: int | None = None
     visits: list[tuple[int, int]] = field(default_factory=list)
     scratchpad: EpisodeScratchpad = field(default_factory=EpisodeScratchpad, repr=False)
+    navigation_memory: MazeNavigationMemory = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.navigation_memory = MazeNavigationMemory(self.entrant.participant_id)
+
+
+@dataclass
+class _KnownMazeCell:
+    open_mask: int = 0
+    traversed_mask: int = 0
+    visits: int = 0
+    landmark: str = ""
+
+
+class MazeNavigationMemory:
+    """Participant-local map reconstructed only from visible passages and accepted moves."""
+
+    _RELATIVE = {"forward": 0, "right": 1, "back": 2, "left": 3}
+    _OUTCOMES = frozenset(("moved", "waited", "invalid", "provider_failure"))
+
+    def __init__(self, participant_id: str) -> None:
+        if participant_id not in PARTICIPANTS:
+            raise ValueError("maze navigation memory participant is invalid")
+        self._participant_id = participant_id
+        self._position = (0, 0)
+        self._heading = 0
+        self._route = [(0, 0)]
+        self._cells: dict[tuple[int, int], _KnownMazeCell] = {}
+        self._last: tuple[str, str] | None = None
+        self._memory = EpisodeMemory()
+
+    @property
+    def utf8(self) -> bytes:
+        return self._memory.utf8
+
+    def observe(
+        self,
+        *,
+        observation_seq: int,
+        visible_passages: Sequence[str],
+        landmark: str,
+    ) -> Mapping[str, Any]:
+        if (
+            isinstance(observation_seq, bool)
+            or not isinstance(observation_seq, int)
+            or observation_seq < 0
+        ):
+            raise ValueError("maze navigation observation sequence is invalid")
+        if any(choice not in self._RELATIVE for choice in visible_passages):
+            raise ValueError("maze navigation passages are invalid")
+        if not isinstance(landmark, str):
+            raise TypeError("maze navigation landmark must be a string")
+        cell = self._cells.setdefault(self._position, _KnownMazeCell())
+        for choice in visible_passages:
+            cell.open_mask |= 1 << ((self._heading + self._RELATIVE[choice]) % 4)
+        cell.visits += 1
+        if landmark != "none":
+            cell.landmark = landmark
+        value = self._snapshot(observation_seq)
+        self._memory.replace(value)
+        return self._memory.snapshot
+
+    def apply_transition(self, choice: str, outcome: str) -> None:
+        if choice not in (*self._RELATIVE, "wait"):
+            raise ValueError("maze navigation choice is invalid")
+        if outcome not in self._OUTCOMES:
+            raise ValueError("maze navigation outcome is invalid")
+        if outcome == "moved":
+            if choice == "wait":
+                raise ValueError("maze navigation cannot move while waiting")
+            absolute = (self._heading + self._RELATIVE[choice]) % 4
+            source = self._position
+            dx, dy = HEADINGS[absolute]
+            target = (source[0] + dx, source[1] + dy)
+            source_cell = self._cells.setdefault(source, _KnownMazeCell())
+            source_cell.open_mask |= 1 << absolute
+            source_cell.traversed_mask |= 1 << absolute
+            reverse = (absolute + 2) % 4
+            target_cell = self._cells.setdefault(target, _KnownMazeCell())
+            target_cell.open_mask |= 1 << reverse
+            target_cell.traversed_mask |= 1 << reverse
+            self._position = target
+            self._heading = absolute
+            if len(self._route) > 1 and target == self._route[-2]:
+                self._route.pop()
+            elif target in self._route:
+                self._route = self._route[: self._route.index(target) + 1]
+            else:
+                self._route.append(target)
+        self._last = (choice, outcome)
+
+    def close(self) -> None:
+        self._memory.close()
+        self._cells.clear()
+        self._route.clear()
+        self._last = None
+
+    def _snapshot(self, observation_seq: int) -> dict[str, Any]:
+        current = self._cells[self._position]
+        untried_mask = current.open_mask & ~current.traversed_mask
+        backtrack = None
+        if len(self._route) > 1:
+            parent = self._route[-2]
+            vector = (parent[0] - self._position[0], parent[1] - self._position[1])
+            absolute = HEADINGS.index(vector)
+            backtrack = _relative_name((absolute - self._heading) % 4)
+        return {
+            "v": "maze-nav/1",
+            "owner": self._participant_id,
+            "turn": observation_seq,
+            "pose": [self._position[0], self._position[1], "NESW"[self._heading]],
+            "last": None if self._last is None else list(self._last),
+            "current": {
+                "visits": current.visits,
+                "untried": self._relative_passages(untried_mask),
+                "backtrack": backtrack,
+            },
+            "cells": [
+                [
+                    position[0],
+                    position[1],
+                    cell.open_mask,
+                    cell.traversed_mask,
+                    cell.visits,
+                    cell.landmark,
+                ]
+                for position, cell in sorted(self._cells.items())
+            ],
+        }
+
+    def _relative_passages(self, mask: int) -> list[str]:
+        return [
+            name
+            for name in ("forward", "right", "back", "left")
+            if mask & (1 << ((self._heading + self._RELATIVE[name]) % 4))
+        ]
 
 
 def _relative_name(relative: int) -> str:
@@ -170,6 +322,12 @@ def _visible_observation(racer: _Racer, *, episode_id: str, tick: int) -> dict[s
     # opponent, or spectator material.
     passages.sort(key=("forward", "right", "back", "left").index)
     observation_id = f"obs_{racer.entrant.participant_id}_{racer.observation_seq:04d}"
+    landmark = LANDMARKS.get(racer.position, "none")
+    navigation_memory = racer.navigation_memory.observe(
+        observation_seq=racer.observation_seq,
+        visible_passages=passages,
+        landmark=landmark,
+    )
     return {
         "episode_id": episode_id,
         "observation_id": observation_id,
@@ -179,8 +337,9 @@ def _visible_observation(racer: _Racer, *, episode_id: str, tick: int) -> dict[s
         "profile": "maze-relative-passages-v1",
         "tick": tick,
         "visible_passages": passages,
-        "landmark": LANDMARKS.get(racer.position, "none"),
+        "landmark": landmark,
         "at_exit": racer.position == _start_exit()[1],
+        "navigation_memory": navigation_memory,
     }
 
 
@@ -285,6 +444,7 @@ async def run_live_labyrinth_race(
                     )
                 )
                 choice = "wait"
+                submitted_choice = "wait"
                 disposition = "wait"
                 if raw is not None:
                     try:
@@ -298,6 +458,7 @@ async def run_live_labyrinth_race(
                         )
                         racer.scratchpad.set(plan.scratchpad_update)
                         choice = plan.passage_choice
+                        submitted_choice = plan.passage_choice
                         disposition = "accepted"
                     except (ValueError, ScratchpadError):
                         racer.invalid_decisions += 1
@@ -310,6 +471,16 @@ async def run_live_labyrinth_race(
                     racer.invalid_decisions += 1
                     disposition = "invalid"
                     choice = "wait"
+                memory_outcome = (
+                    "moved"
+                    if target is not None
+                    else "provider_failure"
+                    if disposition == "provider_failure"
+                    else "waited"
+                    if disposition in {"accepted", "wait"} and submitted_choice == "wait"
+                    else "invalid"
+                )
+                racer.navigation_memory.apply_transition(submitted_choice, memory_outcome)
                 if target is None:
                     racer.waiting_windows += 1
                     events.append(
@@ -345,9 +516,10 @@ async def run_live_labyrinth_race(
             tick += TICKS_PER_CELL
     finally:
         # The objects held in `protected` retain snapshots for internal evidence only; every live
-        # mutable controller scratchpad is securely erased at the episode boundary.
+        # mutable controller scratchpad and navigation memory is erased at the episode boundary.
         for racer in racers:
             racer.scratchpad.close()
+            racer.navigation_memory.close()
     replay = _public_replay(episode_id, racers, events, calls, tick)
     verify_live_replay(replay)
     return LiveMazeRaceExecution(replay, public_live_evaluation(replay), tuple(protected))
@@ -628,7 +800,9 @@ class LiveLabyrinthService:
                 for decision in record.execution.protected_decisions
                 if decision.provider_failure is not None
             ]
-            if provider_failures and len(provider_failures) == len(record.execution.protected_decisions):
+            if provider_failures and len(provider_failures) == len(
+                record.execution.protected_decisions
+            ):
                 record.state = "failed"
                 record.failure = _live_provider_failure_code(provider_failures)
                 return
@@ -657,9 +831,7 @@ class LiveLabyrinthService:
         if self._render_video is None or record.execution is None:
             return
         try:
-            path = await asyncio.to_thread(
-                self._render_video, record.execution.replay
-            )
+            path = await asyncio.to_thread(self._render_video, record.execution.replay)
             path = getattr(path, "video_path", path)
             if not isinstance(path, Path) or not path.is_file():
                 raise LiveLabyrinthError("live labyrinth renderer returned no video")
@@ -740,6 +912,7 @@ __all__ = [
     "LiveLabyrinthService",
     "LiveMazeEntrant",
     "LiveMazeRaceExecution",
+    "MazeNavigationMemory",
     "MazeProvider",
     "ProtectedMazeDecision",
     "public_live_evaluation",

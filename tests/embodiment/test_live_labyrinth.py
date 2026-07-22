@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import time
 from collections import deque
 
 import pytest
+from genesis_arena.embodiment.api import _validate_live_maze_payload
 from genesis_arena.embodiment.labyrinth_run import HEADINGS, _cell_graph, _start_exit
 from genesis_arena.embodiment.live_labyrinth import (
     LIVE_TASK_ID,
+    MAX_LIVE_PROVIDER_CALLS,
     LiveLabyrinthError,
     LiveLabyrinthService,
     LiveMazeEntrant,
+    MazeNavigationMemory,
     public_live_evaluation,
     run_live_labyrinth_race,
     verify_live_replay,
@@ -60,6 +65,39 @@ class FailedMazeProvider:
         )
 
 
+class MemoryMazeProvider:
+    """Explore only from the participant's backend-managed navigation memory."""
+
+    provider_name = "fake"
+
+    def __init__(self) -> None:
+        self.requests: list[ProviderRequest] = []
+
+    async def request(self, request: ProviderRequest) -> ProviderCallResult:
+        self.requests.append(request)
+        observation = strict_json_loads(request.observation_json)
+        memory = observation["navigation_memory"]
+        assert memory["owner"] == request.participant_id
+        current = memory["current"]
+        visible = set(observation["visible_passages"])
+        choice = next(
+            (value for value in current["untried"] if value in visible),
+            current["backtrack"] if current["backtrack"] in visible else "wait",
+        )
+        payload = {
+            "protocol_version": "maze-task-plan-v1",
+            "episode_id": request.episode_id,
+            "observation_id": observation["observation_id"],
+            "participant_id": request.participant_id,
+            "passage_choice": choice,
+            # Deliberately useless notes prove that model-written text does not own navigation.
+            "scratchpad_update": "model note without a map",
+        }
+        return ProviderCallResult.success(
+            canonical_json_bytes(payload), ProviderTelemetry(latency_ms=0)
+        )
+
+
 def _shortest_choices() -> list[str]:
     graph = _cell_graph()
     start, exit_cell = _start_exit()
@@ -98,6 +136,101 @@ def _entrants() -> tuple[LiveMazeEntrant, ...]:
     )
 
 
+def test_navigation_memory_tracks_local_pose_branches_and_failed_turns() -> None:
+    memory = MazeNavigationMemory("participant_0")
+    first = memory.observe(
+        observation_seq=0,
+        visible_passages=("forward", "right"),
+        landmark="none",
+    )
+    assert first["pose"] == [0, 0, "N"]
+    assert first["current"] == {
+        "visits": 1,
+        "untried": ["forward", "right"],
+        "backtrack": None,
+    }
+
+    memory.apply_transition("right", "moved")
+    second = memory.observe(
+        observation_seq=1,
+        visible_passages=("back",),
+        landmark="blue-crystal",
+    )
+    assert second["pose"] == [1, 0, "E"]
+    assert second["last"] == ["right", "moved"]
+    assert second["current"]["untried"] == []
+    assert second["current"]["backtrack"] == "back"
+
+    memory.apply_transition("forward", "invalid")
+    third = memory.observe(
+        observation_seq=2,
+        visible_passages=("back",),
+        landmark="blue-crystal",
+    )
+    assert third["pose"] == [1, 0, "E"]
+    assert third["last"] == ["forward", "invalid"]
+
+    memory.apply_transition("wait", "provider_failure")
+    fourth = memory.observe(
+        observation_seq=3,
+        visible_passages=("back",),
+        landmark="blue-crystal",
+    )
+    assert fourth["pose"] == [1, 0, "E"]
+    assert fourth["last"] == ["wait", "provider_failure"]
+    assert len(memory.utf8) <= 2048
+    memory.close()
+
+
+def test_live_maze_api_accepts_the_full_clock_budget_and_rejects_more() -> None:
+    payload = {
+        "provider": "openai",
+        "api_key": "session-only-test-key",
+        "entrants": [
+            {"display_name": "Sol", "model": "gpt-5.6-sol"},
+            {"display_name": "Terra", "model": "gpt-5.6-terra"},
+            {"display_name": "Luna", "model": "gpt-5.6-luna"},
+        ],
+    }
+    assert _validate_live_maze_payload(payload)["max_provider_calls"] == 450
+    with pytest.raises(ValueError, match="call budget"):
+        _validate_live_maze_payload({**payload, "max_provider_calls": 451})
+
+
+@pytest.mark.asyncio
+async def test_memory_guided_explorers_finish_without_a_hidden_route() -> None:
+    providers = {
+        participant_id: MemoryMazeProvider()
+        for participant_id in ("participant_0", "participant_1", "participant_2")
+    }
+    execution = await run_live_labyrinth_race(
+        episode_id="ep_live_labyrinth_memory",
+        entrants=_entrants(),
+        providers=providers,
+    )
+
+    assert MAX_LIVE_PROVIDER_CALLS == 450
+    assert execution.replay["result"]["reason"] == "all_racers_finished"
+    assert execution.replay["provider_calls"] <= MAX_LIVE_PROVIDER_CALLS
+    assert all(value["finished"] for value in execution.replay["racers"])
+    for participant_id, provider in providers.items():
+        assert provider.requests
+        assert all(
+            strict_json_loads(request.observation_json)["navigation_memory"]["owner"]
+            == participant_id
+            for request in provider.requests
+        )
+        assert all(
+            len(
+                canonical_json_bytes(
+                    strict_json_loads(request.observation_json)["navigation_memory"]
+                )
+            )
+            <= 2048
+            for request in provider.requests
+        )
+
+
 @pytest.mark.asyncio
 async def test_live_race_runs_three_private_provider_calls_and_seals_public_replay() -> None:
     choices = _shortest_choices()
@@ -133,17 +266,28 @@ async def test_live_race_runs_three_private_provider_calls_and_seals_public_repl
             "visible_passages",
             "landmark",
             "at_exit",
+            "navigation_memory",
         }
         assert "participant_0" not in provider.requests[0].system_prompt
         assert provider.requests[0].deadline_monotonic_ns > time.monotonic_ns()
     serialized = repr(execution.replay).casefold()
-    assert all(term not in serialized for term in ("scratchpad", "raw_output", "private route"))
+    assert all(
+        term not in serialized
+        for term in ("scratchpad", "raw_output", "private route", "navigation_memory")
+    )
     assert any(
         item.raw_output and b"private route" in item.raw_output
         for item in execution.protected_decisions
     )
     verify_live_replay(execution.replay)
     assert public_live_evaluation(execution.replay)["verification"]["state"] == "verified"
+
+    leaked = copy.deepcopy(execution.replay)
+    leaked["navigation_memory"] = {"owner": "participant_0"}
+    leaked.pop("final_state_sha256")
+    leaked["final_state_sha256"] = hashlib.sha256(canonical_json_bytes(leaked)).hexdigest()
+    with pytest.raises(LiveLabyrinthError, match="protected controller material"):
+        verify_live_replay(leaked)
 
 
 @pytest.mark.asyncio
@@ -202,7 +346,10 @@ async def test_service_reports_a_safe_credential_failure_instead_of_a_tick_zero_
     service = LiveLabyrinthService()
     created = await service.create(
         entrants=_entrants(),
-        providers={participant_id: FailedMazeProvider() for participant_id in ("participant_0", "participant_1", "participant_2")},
+        providers={
+            participant_id: FailedMazeProvider()
+            for participant_id in ("participant_0", "participant_1", "participant_2")
+        },
         max_provider_calls=3,
     )
     for _ in range(20):

@@ -598,7 +598,7 @@ export async function createRun(setup: EpisodeSetup): Promise<EpisodeView> {
           body: JSON.stringify({
             provider: setup.provider,
             api_key: setup.apiKey,
-            max_provider_calls: 180,
+            max_provider_calls: 450,
             entrants: [
               { display_name: "Sol", model: setup.model },
               { display_name: "Terra", model: setup.opponentModel },

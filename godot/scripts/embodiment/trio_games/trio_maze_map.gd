@@ -120,9 +120,11 @@ static func fixture_invariants() -> Dictionary:
 			if not is_walkable(cell):
 				continue
 			walkable += 1
-			var kind := location_type(cell)
-			junctions += 1 if kind == "junction" else 0
-			dead_ends += 1 if kind == "dead_end" else 0
+			var degree := neighbours(cell).size()
+			# Topology metrics count the exit when it is also a junction, while observations
+			# still present that cell as the semantically stronger `exit` location type.
+			junctions += 1 if degree >= 3 else 0
+			dead_ends += 1 if degree == 1 and cell != start_cell() else 0
 	return {
 		"walkable_cells": walkable,
 		"junctions": junctions,

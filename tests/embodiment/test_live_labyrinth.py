@@ -16,6 +16,7 @@ from genesis_arena.embodiment.live_labyrinth import (
     LiveLabyrinthService,
     LiveMazeEntrant,
     MazeNavigationMemory,
+    maze_visible_cells,
     public_live_evaluation,
     run_live_labyrinth_race,
     verify_live_replay,
@@ -49,6 +50,8 @@ class ScriptedMazeProvider:
             else observation["observation_id"],
             "participant_id": request.participant_id,
             "passage_choice": choice,
+            "movement_mode": "single_cell",
+            "max_corridor_cells": 1,
             "scratchpad_update": "private route note",
         }
         return ProviderCallResult.success(
@@ -90,6 +93,8 @@ class MemoryMazeProvider:
             "observation_id": observation["observation_id"],
             "participant_id": request.participant_id,
             "passage_choice": choice,
+            "movement_mode": "follow_corridor" if choice != "wait" else "single_cell",
+            "max_corridor_cells": 256 if choice != "wait" else 1,
             # Deliberately useless notes prove that model-written text does not own navigation.
             "scratchpad_update": "model note without a map",
         }
@@ -182,6 +187,16 @@ def test_navigation_memory_tracks_local_pose_branches_and_failed_turns() -> None
     memory.close()
 
 
+def test_configurable_straight_line_vision_stops_at_walls_and_never_turns_corners() -> None:
+    start = _start_exit()[0]
+    assert maze_visible_cells(start, 1) == ((7, 13), (8, 13))
+    assert maze_visible_cells(start, 2) == ((7, 13), (8, 13), (9, 13))
+    infinite = maze_visible_cells(start, "infinite")
+    assert infinite == ((7, 13), (8, 13), (9, 13), (10, 13), (11, 13))
+    # The final visible cell exposes its north branch, but vision does not turn into that branch.
+    assert (11, 12) not in infinite
+
+
 def test_live_maze_api_accepts_the_full_clock_budget_and_rejects_more() -> None:
     payload = {
         "provider": "openai",
@@ -193,8 +208,17 @@ def test_live_maze_api_accepts_the_full_clock_budget_and_rejects_more() -> None:
         ],
     }
     assert _validate_live_maze_payload(payload)["max_provider_calls"] == 450
+    assert _validate_live_maze_payload(payload)["vision_range_cells"] == 4
+    assert (
+        _validate_live_maze_payload({**payload, "vision_range_cells": "infinite"})[
+            "vision_range_cells"
+        ]
+        == "infinite"
+    )
     with pytest.raises(ValueError, match="call budget"):
         _validate_live_maze_payload({**payload, "max_provider_calls": 451})
+    with pytest.raises(ValueError, match="vision range"):
+        _validate_live_maze_payload({**payload, "vision_range_cells": 0})
 
 
 @pytest.mark.asyncio
@@ -215,6 +239,7 @@ async def test_memory_guided_explorers_finish_without_a_hidden_route() -> None:
     assert all(value["finished"] for value in execution.replay["racers"])
     for participant_id, provider in providers.items():
         assert provider.requests
+        assert len(provider.requests) < 64
         assert all(
             strict_json_loads(request.observation_json)["navigation_memory"]["owner"]
             == participant_id
@@ -264,8 +289,10 @@ async def test_live_race_runs_three_private_provider_calls_and_seals_public_repl
             "profile",
             "tick",
             "visible_passages",
+            "vision",
             "landmark",
             "at_exit",
+            "movement_receipt",
             "navigation_memory",
         }
         assert "participant_0" not in provider.requests[0].system_prompt
@@ -288,6 +315,61 @@ async def test_live_race_runs_three_private_provider_calls_and_seals_public_repl
     leaked["final_state_sha256"] = hashlib.sha256(canonical_json_bytes(leaked)).hexdigest()
     with pytest.raises(LiveLabyrinthError, match="protected controller material"):
         verify_live_replay(leaked)
+
+    for protected_key in (
+        "navigation-memory",
+        "model_scratchpad",
+        "raw-output-copy",
+        "rawPrompt",
+        "navigationMemory",
+        "chainOfThought",
+    ):
+        leaked = copy.deepcopy(execution.replay)
+        leaked[protected_key] = "must not publish"
+        leaked.pop("final_state_sha256")
+        leaked["final_state_sha256"] = hashlib.sha256(
+            canonical_json_bytes(leaked)
+        ).hexdigest()
+        with pytest.raises(LiveLabyrinthError, match="protected controller material"):
+            verify_live_replay(leaked)
+
+    tampered_replays = []
+    tampered = copy.deepcopy(execution.replay)
+    tampered["result"]["winner_id"] = "participant_2"
+    tampered_replays.append(tampered)
+    tampered = copy.deepcopy(execution.replay)
+    tampered["result"]["reason"] = "decision_budget_or_tick_limit"
+    tampered_replays.append(tampered)
+    tampered = copy.deepcopy(execution.replay)
+    tampered["result"]["completion_tick"] += 4
+    tampered_replays.append(tampered)
+    tampered = copy.deepcopy(execution.replay)
+    tampered["racers"][0]["path_efficiency_basis_points"] += 1
+    tampered_replays.append(tampered)
+    tampered = copy.deepcopy(execution.replay)
+    tampered["racers"][0]["invalid_decisions"] += 1
+    tampered_replays.append(tampered)
+    tampered = copy.deepcopy(execution.replay)
+    tampered["racers"][0]["waiting_windows"] += 1
+    tampered_replays.append(tampered)
+    tampered = copy.deepcopy(execution.replay)
+    first_move = next(value for value in tampered["events"] if value["kind"] == "move")
+    first_move["choice"] = "back" if first_move["choice"] != "back" else "forward"
+    tampered_replays.append(tampered)
+    tampered = copy.deepcopy(execution.replay)
+    tampered["racers"][0]["finish_tick"] += 4
+    tampered_replays.append(tampered)
+    tampered = copy.deepcopy(execution.replay)
+    tampered["unexpected_public_field"] = True
+    tampered_replays.append(tampered)
+
+    for tampered in tampered_replays:
+        tampered.pop("final_state_sha256")
+        tampered["final_state_sha256"] = hashlib.sha256(
+            canonical_json_bytes(tampered)
+        ).hexdigest()
+        with pytest.raises(LiveLabyrinthError):
+            verify_live_replay(tampered)
 
 
 @pytest.mark.asyncio

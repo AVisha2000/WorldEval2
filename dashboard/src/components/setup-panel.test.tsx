@@ -34,6 +34,19 @@ describe("SetupPanel", () => {
     expect(screen.queryByLabelText("Configurable deterministic demos")).not.toBeInTheDocument()
   })
 
+  it("configures live Labyrinth sightlines without changing other game modes", async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    render(<SetupPanel setup={{ ...setup, mode: "trio", mazeVisionRange: 4 }} pending={false} onChange={onChange} onSubmit={vi.fn()} onQuickStart={vi.fn()} onTeamQuickStart={vi.fn()} onRtsQuickStart={vi.fn()} onMazeQuickStart={vi.fn()} onCrossroadsQuickStart={vi.fn()} onSoloQuickStart={vi.fn()} />)
+
+    await user.click(screen.getByRole("combobox", { name: "Agent field of view" }))
+    expect(await screen.findByRole("option", { name: "1 cell · immediate surroundings" })).toBeInTheDocument()
+    expect(screen.getByRole("option", { name: "Infinite · to the next wall" })).toBeInTheDocument()
+    await user.click(screen.getByRole("option", { name: "Infinite · to the next wall" }))
+    expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ mazeVisionRange: "infinite" }))
+    expect(screen.getByText(/explicitly issue a bounded follow-corridor command/i)).toBeInTheDocument()
+  })
+
   it("starts any scripted solo stage without a key and hides provider controls", async () => {
     const user = userEvent.setup()
     const onChange = vi.fn()

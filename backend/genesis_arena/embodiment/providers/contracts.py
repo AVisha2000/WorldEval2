@@ -93,10 +93,17 @@ class ProviderTelemetry:
     input_tokens: int | None = None
     output_tokens: int | None = None
     cached_input_tokens: int | None = None
+    cache_write_tokens: int | None = None
     request_id_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        for name in ("latency_ms", "input_tokens", "output_tokens", "cached_input_tokens"):
+        for name in (
+            "latency_ms",
+            "input_tokens",
+            "output_tokens",
+            "cached_input_tokens",
+            "cache_write_tokens",
+        ):
             value = getattr(self, name)
             if value is not None and (
                 isinstance(value, bool) or not isinstance(value, int) or value < 0
@@ -111,6 +118,7 @@ class ProviderTelemetry:
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cached_input_tokens": self.cached_input_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
             "request_id_sha256": self.request_id_sha256,
         }
 

@@ -18,6 +18,7 @@ import {
   isDemoScenario,
   type DemoScenarioId,
   type EpisodeSetup,
+  type MazeVisionRange,
   type OpponentProvider,
   type Provider,
 } from "@/api"
@@ -196,6 +197,7 @@ export function SetupPanel({ setup, pending, onChange, onSubmit, onQuickStart, o
     opponentProvider: "openai",
     opponentModel: "gpt-5.6-terra",
     thirdModel: "gpt-5.6-luna",
+    mazeVisionRange: setup.mazeVisionRange ?? 4,
   })
   const setProvider = (provider: Provider) => onChange({ ...setup, provider, model: PROVIDER_MODELS[provider] })
   const setOpponentProvider = (opponentProvider: OpponentProvider) => onChange({
@@ -283,7 +285,27 @@ export function SetupPanel({ setup, pending, onChange, onSubmit, onQuickStart, o
           {modelField("model", "Sol model", setup.provider, setup.model, (model) => onChange({ ...setup, model }))}
           {modelField("opponent-model", "Terra model", setup.provider, setup.opponentModel, (opponentModel) => onChange({ ...setup, opponentModel }))}
           {modelField("third-model", "Luna model", setup.provider, setup.thirdModel ?? "gpt-5.6-luna", (thirdModel) => onChange({ ...setup, thirdModel }))}
-          <Field><FieldLabel>Live-call safety limit</FieldLabel><FieldDescription>One shared provider key is used for all three slots; the race stops before 180 provider calls.</FieldDescription></Field>
+          <Field>
+            <FieldLabel htmlFor="maze-vision-range">Agent field of view</FieldLabel>
+            <Select
+              value={String(setup.mazeVisionRange ?? 4)}
+              onValueChange={(value) => value && onChange({
+                ...setup,
+                mazeVisionRange: (value === "infinite" ? value : Number(value)) as MazeVisionRange,
+              })}
+            >
+              <SelectTrigger id="maze-vision-range" className="w-full"><SelectValue /></SelectTrigger>
+              <SelectContent><SelectGroup>
+                <SelectItem value="1">1 cell · immediate surroundings</SelectItem>
+                <SelectItem value="2">2 cells</SelectItem>
+                <SelectItem value="4">4 cells · default</SelectItem>
+                <SelectItem value="8">8 cells</SelectItem>
+                <SelectItem value="infinite">Infinite · to the next wall</SelectItem>
+              </SelectGroup></SelectContent>
+            </Select>
+            <FieldDescription>Straight, wall-occluded sightlines only. The agent can see branch openings along a corridor, but never around a corner. Gold tiles in the replay show the exact visible region.</FieldDescription>
+          </Field>
+          <Field><FieldLabel>Per-racer decision budget</FieldLabel><FieldDescription>Each racer gets an independent allowance equal to twice the maze&apos;s undirected edges (192 calls on this map), so one racer cannot spend another&apos;s budget. An agent may explicitly issue a bounded follow-corridor command to reduce calls without surrendering control.</FieldDescription></Field>
         </> : <>
           <Field><FieldLabel htmlFor="opponent-provider">Opponent controller</FieldLabel><Select value={setup.opponentProvider} onValueChange={(value) => setOpponentProvider(value as OpponentProvider)}><SelectTrigger id="opponent-provider" className="w-full"><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="scripted">Scripted baseline</SelectItem><SelectItem value="openai">OpenAI</SelectItem><SelectItem value="anthropic">Anthropic</SelectItem><SelectItem value="gemini">Gemini</SelectItem></SelectGroup></SelectContent></Select></Field>
           {setup.opponentProvider === "scripted" ? <Field><FieldLabel htmlFor="opponent-model">Scripted tier</FieldLabel><Select value={setup.opponentModel} onValueChange={(opponentModel) => opponentModel && onChange({ ...setup, opponentModel })}><SelectTrigger id="opponent-model" className="w-full"><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="scout-v1">Scout</SelectItem><SelectItem value="balanced-v1">Balanced</SelectItem><SelectItem value="challenger-v1">Challenger</SelectItem></SelectGroup></SelectContent></Select><FieldDescription>Deterministic and credential-free; consumes only participant-visible observations.</FieldDescription></Field> : <>

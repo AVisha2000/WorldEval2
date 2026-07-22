@@ -429,16 +429,44 @@ describe("Live Labyrinth Run", () => {
       thirdModel: "gpt-5.6-luna",
     })
 
-    expect(fetch.mock.calls[0]?.[0]).toBe("/api/embodiment/maze-races")
+    expect((fetch.mock.calls[0] as unknown as [unknown])[0]).toBe("/api/embodiment/maze-races")
     const payload = JSON.parse(
       String((fetch.mock.calls[0] as unknown as [unknown, RequestInit])[1].body)
     )
     expect(payload.max_provider_calls).toBe(450)
+    expect(payload.vision_range_cells).toBe(4)
     expect(payload.entrants).toEqual([
       { display_name: "Sol", model: "gpt-5.6-sol" },
       { display_name: "Terra", model: "gpt-5.6-terra" },
       { display_name: "Luna", model: "gpt-5.6-luna" },
     ])
+  })
+
+  it("sends the selected infinite corridor sightline", async () => {
+    const fetch = vi.fn(async () => response({
+      episode_id: "ep_live_labyrinth_vision",
+      task_id: "trio-maze-race-v1",
+      state: "queued",
+      entrants: [],
+      video: { state: "unavailable" },
+    }))
+    vi.stubGlobal("fetch", fetch)
+
+    await createRun({
+      ...scriptedDemoSetup,
+      controllerMode: "live_provider",
+      mode: "trio",
+      apiKey: "session-only-test-key",
+      opponentProvider: "openai",
+      opponentModel: "gpt-5.6-terra",
+      thirdModel: "gpt-5.6-luna",
+      mazeVisionRange: "infinite",
+    })
+
+    const payload = JSON.parse(
+      String((fetch.mock.calls[0] as unknown as [unknown, RequestInit])[1].body)
+    )
+    expect(payload.vision_range_cells).toBe("infinite")
   })
 })
 

@@ -25,11 +25,15 @@ dev = [
   "pytest-asyncio>=0.24,<1",
   "ruff>=0.8,<1",
 ]
+benchmark = [
+  "matplotlib>=3.9,<4",
+]
 
 [project.scripts]
 genesis-arena = "genesis_arena.main:run"
 genesis-evaluate = "genesis_arena.evaluation:main"
 genesis-season-schedule = "genesis_arena.season_cli:main"
+genesis-labyrinth-benchmark = "genesis_arena.embodiment.labyrinth_benchmark.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["backend/genesis_arena"]

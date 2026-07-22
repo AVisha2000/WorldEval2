@@ -32,19 +32,23 @@ func _run() -> void:
 	if not scene.configure_replay(replay):
 		_fail("labyrinth_movie_maker_projection_rejected")
 		return
+	var maximum_ticks: Variant = replay.get("maximum_ticks", 600)
+	if typeof(maximum_ticks) != TYPE_INT or maximum_ticks < 1 or maximum_ticks > 100_000:
+		_fail("labyrinth_movie_maker_projection_rejected")
+		return
 	for frame: int in INTRO_FRAMES:
 		if not scene.apply_race_time(-1000):
 			_fail("labyrinth_movie_maker_projection_rejected")
 			return
 		await process_frame
-	for tick: int in 600:
+	for tick: int in int(maximum_ticks):
 		for frame: int in FRAMES_PER_TICK:
 			if not scene.apply_race_time(tick * 1000 + (frame + 1) * 1000 / FRAMES_PER_TICK):
 				_fail("labyrinth_movie_maker_projection_rejected")
 				return
 			await process_frame
 	for frame: int in OUTRO_FRAMES:
-		if not scene.apply_race_time(600000):
+		if not scene.apply_race_time(int(maximum_ticks) * 1000):
 			_fail("labyrinth_movie_maker_projection_rejected")
 			return
 		await process_frame

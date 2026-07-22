@@ -1,6 +1,7 @@
 export type Provider = "openai" | "anthropic" | "gemini"
 export type OpponentProvider = Provider | "scripted"
 export type ControllerMode = "scripted_demo" | "live_provider"
+export type MazeVisionRange = 1 | 2 | 4 | 8 | "infinite"
 export const DEMO_SCENARIOS = {
   "orientation-v0": {
     authorityTaskId: "orientation-v0",
@@ -134,6 +135,7 @@ export type EpisodeSetup = {
   opponentModel: string
   opponentApiKey: string
   thirdModel?: string
+  mazeVisionRange?: MazeVisionRange
   scenarioId: string
   taskId: string
   duoTaskId?: DemoDuoGameId
@@ -599,6 +601,7 @@ export async function createRun(setup: EpisodeSetup): Promise<EpisodeView> {
             provider: setup.provider,
             api_key: setup.apiKey,
             max_provider_calls: 450,
+            vision_range_cells: setup.mazeVisionRange ?? 4,
             entrants: [
               { display_name: "Sol", model: setup.model },
               { display_name: "Terra", model: setup.opponentModel },

@@ -21,9 +21,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from .labyrinth_run import HEADINGS, MAXIMUM_TICKS, PROTOCOL_VERSION
-from .live_labyrinth import LIVE_TASK_ID, verify_live_replay
-from .protocol import canonical_json_bytes
+from .labyrinth_run import HEADINGS, PROTOCOL_VERSION
+from .live_labyrinth import LIVE_TASK_ID, normalize_vision_range, verify_live_replay
+from .maze_maps import MazeMapError, MazeMapSpec
+from .protocol import canonical_json_bytes, strict_json_loads
 
 _BROADCAST_TASK_ID = "trio-maze-race-v0"
 _BROADCAST_SCHEMA = "worldarena/live-labyrinth-broadcast-projection/1"
@@ -31,8 +32,10 @@ _MOVIE_SCRIPT = "res://scripts/embodiment/trio_games/trio_maze_movie_maker_cli.g
 _WIDTH = 1920
 _HEIGHT = 1080
 _FPS = 30
-_EXPECTED_FRAMES = 5 * _FPS + MAXIMUM_TICKS * 3 + 7 * _FPS
-_EXPECTED_DURATION_MS = _EXPECTED_FRAMES * 1000 // _FPS
+_INTRO_FRAMES = 5 * _FPS
+_OUTRO_FRAMES = 7 * _FPS
+_FRAMES_PER_TICK = 3
+_MAXIMUM_RENDER_TICKS = 100_000
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -87,6 +90,19 @@ def project_live_labyrinth_broadcast_replay(replay: Mapping[str, Any]) -> dict[s
     result = replay.get("result")
     if not isinstance(events, list) or not isinstance(result, Mapping):
         raise LiveLabyrinthMediaError("live maze public timeline is unavailable")
+    vision = replay.get("vision")
+    if not isinstance(vision, Mapping):
+        raise LiveLabyrinthMediaError("live maze public vision configuration is unavailable")
+    vision_range_cells = vision.get("range_cells")
+    maximum_ticks = replay.get("maximum_ticks")
+    if (
+        isinstance(maximum_ticks, bool)
+        or not isinstance(maximum_ticks, int)
+        or not 1 <= maximum_ticks <= _MAXIMUM_RENDER_TICKS
+    ):
+        raise LiveLabyrinthMediaError("live maze maximum ticks is invalid")
+    public_map = _project_public_map(replay.get("map"))
+    rows = tuple(public_map["rows"])
 
     events_by_participant: dict[str, list[Mapping[str, Any]]] = {}
     for event in events:
@@ -107,6 +123,9 @@ def project_live_labyrinth_broadcast_replay(replay: Mapping[str, Any]) -> dict[s
         keyframes = _project_keyframes(
             racer,
             events_by_participant.get(participant_id, ()),
+            rows=rows,
+            maximum_ticks=maximum_ticks,
+            vision_range_cells=vision_range_cells,
         )
         projected_racers.append(
             {
@@ -127,6 +146,9 @@ def project_live_labyrinth_broadcast_replay(replay: Mapping[str, Any]) -> dict[s
     completion_tick = result.get("completion_tick")
     if isinstance(completion_tick, bool) or not isinstance(completion_tick, int):
         raise LiveLabyrinthMediaError("live maze completion tick is invalid")
+    reason = result.get("reason")
+    if not isinstance(reason, str):
+        raise LiveLabyrinthMediaError("live maze result reason is invalid")
     projected_events = [_project_event(event) for event in events]
     body: dict[str, Any] = {
         "schema_version": _BROADCAST_SCHEMA,
@@ -135,11 +157,15 @@ def project_live_labyrinth_broadcast_replay(replay: Mapping[str, Any]) -> dict[s
         "task_id": _BROADCAST_TASK_ID,
         "protocol_version": PROTOCOL_VERSION,
         "episode_id": replay["episode_id"],
+        "maximum_ticks": maximum_ticks,
+        "map": public_map,
+        "vision": dict(vision),
         "racers": projected_racers,
         "events": projected_events,
         "result": {
             "completion_tick": completion_tick,
             "finish_order": list(result.get("finish_order", ())),
+            "reason": reason,
             "winner_id": result.get("winner_id"),
         },
         "source": {
@@ -154,6 +180,10 @@ def project_live_labyrinth_broadcast_replay(replay: Mapping[str, Any]) -> dict[s
 def _project_keyframes(
     racer: Mapping[str, Any],
     events: tuple[Mapping[str, Any], ...] | list[Mapping[str, Any]],
+    *,
+    rows: tuple[str, ...],
+    maximum_ticks: int,
+    vision_range_cells: object,
 ) -> list[dict[str, object]]:
     path = racer.get("path")
     if not isinstance(path, list) or not path:
@@ -170,7 +200,7 @@ def _project_keyframes(
     ordered: dict[int, list[Mapping[str, Any]]] = {}
     for event in events:
         tick = event.get("tick")
-        if isinstance(tick, bool) or not isinstance(tick, int) or not 0 < tick <= MAXIMUM_TICKS:
+        if isinstance(tick, bool) or not isinstance(tick, int) or not 0 < tick <= maximum_ticks:
             raise LiveLabyrinthMediaError("live maze event tick is invalid")
         ordered.setdefault(tick, []).append(event)
 
@@ -184,6 +214,9 @@ def _project_keyframes(
             "heading": heading,
             "state": "thinking",
             "task": "exploring",
+            "visible_cells": [
+                list(cell) for cell in _visible_cells(rows, current, vision_range_cells)
+            ],
         }
     ]
     for tick in sorted(ordered):
@@ -221,11 +254,75 @@ def _project_keyframes(
                 "heading": heading,
                 "state": state,
                 "task": task,
+                "visible_cells": [
+                    list(cell) for cell in _visible_cells(rows, current, vision_range_cells)
+                ],
             }
         )
     if cursor != len(cells):
         raise LiveLabyrinthMediaError("live maze public move track is incomplete")
     return frames
+
+
+def _project_public_map(value: object) -> dict[str, Any]:
+    """Return the verifier-approved, JSON-safe public map without adding private state."""
+
+    if not isinstance(value, Mapping):
+        raise LiveLabyrinthMediaError("live maze public map is unavailable")
+    try:
+        return MazeMapSpec.from_dict(value).as_dict()
+    except MazeMapError:
+        # Live replays produced before map-spec/1 carried the fixed showcase geometry plus flat
+        # topology metrics.  Their authority verifier remains the compatibility boundary while
+        # archived episodes drain; all newly generated maps take the strict branch above.
+        if "schema_version" in value or "start" in value or "exit" in value:
+            raise LiveLabyrinthMediaError("live maze public map is invalid") from None
+    try:
+        public_map = strict_json_loads(canonical_json_bytes(value))
+    except (TypeError, ValueError) as error:
+        raise LiveLabyrinthMediaError("live maze public map is invalid") from error
+    if not isinstance(public_map, dict):
+        raise LiveLabyrinthMediaError("live maze public map is invalid")
+    rows = public_map.get("rows")
+    if (
+        not isinstance(rows, list)
+        or not rows
+        or any(not isinstance(row, str) or not row for row in rows)
+        or len({len(row) for row in rows}) != 1
+    ):
+        raise LiveLabyrinthMediaError("live maze public map rows are invalid")
+    return public_map
+
+
+def _visible_cells(
+    rows: tuple[str, ...],
+    position: tuple[int, int],
+    vision_range_cells: object,
+) -> tuple[tuple[int, int], ...]:
+    """Project straight-line sightlines against the replay's injected public geometry."""
+
+    try:
+        vision_range = normalize_vision_range(vision_range_cells)
+    except ValueError as error:
+        raise LiveLabyrinthMediaError("live maze public vision range is invalid") from error
+
+    width = len(rows[0])
+
+    def walkable(cell: tuple[int, int]) -> bool:
+        x, y = cell
+        return 0 <= y < len(rows) and 0 <= x < width and rows[y][x] != "#"
+
+    if not walkable(position):
+        raise LiveLabyrinthMediaError("live maze public path is outside the map")
+    limit = max(width, len(rows)) if vision_range == "infinite" else vision_range
+    visible = {position}
+    for dx, dy in HEADINGS:
+        for distance in range(1, limit + 1):
+            candidate = (position[0] + dx * distance, position[1] + dy * distance)
+            if not walkable(candidate):
+                break
+            visible.add(candidate)
+    return tuple(sorted(visible))
 
 
 def _project_event(event: Mapping[str, Any]) -> dict[str, object]:
@@ -356,7 +453,8 @@ def render_live_labyrinth_broadcast_mp4(
             failure="FFmpeg live maze broadcast encoding failed",
         )
     duration_ms = _verify_video(output, ffmpeg)
-    if abs(duration_ms - _EXPECTED_DURATION_MS) > 100:
+    expected_duration_ms = _expected_duration_milliseconds(int(projected["maximum_ticks"]))
+    if abs(duration_ms - expected_duration_ms) > 100:
         output.unlink(missing_ok=True)
         raise LiveLabyrinthMediaError("live maze broadcast duration differs")
     payload = output.read_bytes()
@@ -367,6 +465,11 @@ def render_live_labyrinth_broadcast_mp4(
         size_bytes=len(payload),
         duration_milliseconds=duration_ms,
     )
+
+
+def _expected_duration_milliseconds(maximum_ticks: int) -> int:
+    frames = _INTRO_FRAMES + maximum_ticks * _FRAMES_PER_TICK + _OUTRO_FRAMES
+    return frames * 1000 // _FPS
 
 
 class LiveLabyrinthBroadcastRenderer:

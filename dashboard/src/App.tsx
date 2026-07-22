@@ -40,6 +40,7 @@ const INITIAL_SETUP: EpisodeSetup = {
   opponentProvider: "scripted",
   opponentModel: "balanced-v1",
   opponentApiKey: "",
+  mazeVisionRange: 4,
   scenarioId: "construction-v0",
   taskId: "construction-v0",
   seed: 20240520,

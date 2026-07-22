@@ -19,7 +19,6 @@ from .contracts import (
     ProviderTelemetry,
 )
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -41,6 +40,7 @@ class OpenAIProviderAdapter:
         api_key: str | None = None,
         audit_log: InMemoryProviderAuditLog | None = None,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
+        service_tier: str | None = None,
     ) -> None:
         if client is not None and api_key is not None:
             raise ValueError("pass either client or api_key, not both")
@@ -50,9 +50,12 @@ class OpenAIProviderAdapter:
             from openai import AsyncOpenAI
 
             client = AsyncOpenAI(api_key=api_key, max_retries=0)
+        if service_tier not in {None, "default", "flex", "priority"}:
+            raise ValueError("service_tier is invalid")
         self._client = client
         self._audit_log = audit_log or InMemoryProviderAuditLog()
         self._monotonic_ns = monotonic_ns
+        self._service_tier = service_tier
 
     @property
     def audit_log(self) -> InMemoryProviderAuditLog:
@@ -75,6 +78,8 @@ class OpenAIProviderAdapter:
 
         try:
             payload = _build_payload(request)
+            if self._service_tier is not None:
+                payload["service_tier"] = self._service_tier
         except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
             return self._finish(
                 request,
@@ -270,6 +275,7 @@ def _telemetry(response: Any, started_ns: int, completed_ns: int) -> ProviderTel
         input_tokens=_non_negative_int(_field(usage, "input_tokens")),
         output_tokens=_non_negative_int(_field(usage, "output_tokens")),
         cached_input_tokens=_non_negative_int(_field(input_details, "cached_tokens")),
+        cache_write_tokens=_non_negative_int(_field(input_details, "cache_write_tokens")),
         request_id_sha256=request_id_sha256,
     )
 
@@ -286,8 +292,11 @@ def _classify_failure(error: Exception) -> ProviderFailureKind:
 
     name = type(error).__name__.lower()
     status_code = getattr(error, "status_code", None)
+    error_codes = _safe_error_codes(error)
     if "timeout" in name:
         return ProviderFailureKind.TIMEOUT
+    if error_codes & {"insufficient_quota", "billing_hard_limit_reached", "quota_exceeded"}:
+        return ProviderFailureKind.QUOTA
     if status_code == 429 or "ratelimit" in name or "rate_limit" in name:
         return ProviderFailureKind.RATE_LIMIT
     if status_code in (401, 403) or "authentication" in name or "permission" in name:
@@ -297,3 +306,18 @@ def _classify_failure(error: Exception) -> ProviderFailureKind:
     if isinstance(status_code, int):
         return ProviderFailureKind.INTERNAL
     return ProviderFailureKind.INTERNAL
+
+
+def _safe_error_codes(error: Exception) -> set[str]:
+    """Read only stable SDK code/type fields; never retain messages or response bodies."""
+
+    values = []
+    for name in ("code", "type"):
+        values.append(getattr(error, name, None))
+    body = getattr(error, "body", None)
+    if isinstance(body, dict):
+        values.extend((body.get("code"), body.get("type")))
+        nested = body.get("error")
+        if isinstance(nested, dict):
+            values.extend((nested.get("code"), nested.get("type")))
+    return {value.casefold() for value in values if isinstance(value, str) and value}

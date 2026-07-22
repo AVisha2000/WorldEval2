@@ -5,7 +5,6 @@ const YBot := preload("res://scenes/embodiment/y_bot_operator.tscn")
 const EntrantPalette := preload("res://scripts/embodiment/presentation/entrant_palette.gd")
 const MazeMap := preload("res://scripts/embodiment/trio_games/trio_maze_map.gd")
 const PARTICIPANTS := ["participant_0", "participant_1", "participant_2"]
-const LANE_OFFSETS := {"participant_0": -18.0, "participant_1": 0.0, "participant_2": 18.0}
 const LANE_TONES := {
 	"participant_0": Color("8b6a18"),
 	"participant_1": Color("684b8f"),
@@ -13,8 +12,12 @@ const LANE_TONES := {
 }
 
 var _world: Node3D
+var _geometry: Node3D
 var _camera: Camera3D
 var _racers := {}
+var _visibility_tiles := {}
+var _visible_tile_keys := {}
+var _trail_markers := {}
 var _replay := {}
 var _tick_milli := -1000
 var _hud: RichTextLabel
@@ -23,6 +26,17 @@ var _event_feed: Label
 var _title_card: Control
 var _winner_card: Control
 var _winner_text: RichTextLabel
+var _map_rows: Array[String] = []
+var _map_start := Vector2i.ZERO
+var _map_exit := Vector2i.ZERO
+var _map_landmarks: Array[Dictionary] = []
+var _map_width := 15
+var _map_height := 15
+var _map_center := Vector2(7.0, 7.0)
+var _tile_scale := 1.0
+var _lane_spacing := 18.0
+var _lane_offsets := {"participant_0": -18.0, "participant_1": 0.0, "participant_2": 18.0}
+var _maximum_ticks := 600
 
 
 func _ready() -> void:
@@ -32,26 +46,51 @@ func _ready() -> void:
 func configure_replay(replay: Dictionary) -> bool:
 	_build()
 	if replay.get("task_id") != MazeMap.TASK_ID or replay.get("protocol_version") != MazeMap.PROTOCOL_VERSION \
-			or not replay.get("racers") is Array or replay.racers.size() != 3:
+			or not replay.get("racers") is Array or replay.racers.size() != 3 \
+			or not replay.get("events", []) is Array or not replay.get("result", {}) is Dictionary:
+		return false
+	var maximum_ticks: Variant = replay.get("maximum_ticks", 600)
+	if typeof(maximum_ticks) != TYPE_INT or maximum_ticks < 1 or maximum_ticks > 100_000:
+		return false
+	var map_config := _normalise_map(replay.get("map", {}))
+	if map_config.is_empty():
 		return false
 	var seen := {}
 	for value: Variant in replay.racers:
 		if not value is Dictionary or value.get("participant_id") not in PARTICIPANTS \
 				or not value.get("keyframes") is Array or value.keyframes.is_empty():
 			return false
+		for keyframe: Variant in value.keyframes:
+			if not keyframe is Dictionary or not _valid_keyframe(keyframe, map_config, int(maximum_ticks)):
+				return false
 		seen[value.participant_id] = value
 	if seen.size() != 3:
 		return false
+	_apply_map_config(map_config)
+	_maximum_ticks = int(maximum_ticks)
 	_replay = replay.duplicate(true)
+	_rebuild_geometry()
+	for racer_value: Variant in _replay.racers:
+		var racer: Dictionary = racer_value
+		var participant_id := str(racer.participant_id)
+		var actor: Node3D = _racers[participant_id]
+		var entrant_id := str(racer.display_name).to_lower()
+		if entrant_id in ["sol", "luna", "terra"]:
+			EntrantPalette.tint_avatar(actor, entrant_id)
+		(actor.get_node("RacerLabel") as Label3D).modulate = Color(str(racer.color))
+		var banner_label := _geometry.get_node_or_null("%sBanner/Label" % participant_id) as Label3D
+		if banner_label != null:
+			banner_label.text = str(racer.display_name).to_upper()
+	_build_trails()
 	_winner_text.text = _winner_card_copy()
 	return apply_race_time(-1000)
 
 
 func apply_race_time(tick_milli: int) -> bool:
-	if _replay.is_empty() or tick_milli < -1000 or tick_milli > 600000:
+	if _replay.is_empty() or tick_milli < -1000 or tick_milli > _maximum_ticks * 1000:
 		return false
 	_tick_milli = tick_milli
-	var authority_tick := clampi(tick_milli / 1000, 0, 600)
+	var authority_tick := clampi(tick_milli / 1000, 0, _maximum_ticks)
 	for value: Variant in _replay.racers:
 		var racer: Dictionary = value
 		var participant_id := str(racer.participant_id)
@@ -67,27 +106,181 @@ func apply_race_time(tick_milli: int) -> bool:
 		label.text = "%s\n%s" % [str(racer.display_name).to_upper(), str(pose.task).to_upper().replace("_", " ")]
 		var bubble := actor.get_node("Speech") as Label3D
 		bubble.text = _safe_event_label(participant_id, authority_tick)
+		_apply_visibility(participant_id, pose.get("visible_cells", []))
+		_apply_trail(participant_id, authority_tick)
 	_update_hud(authority_tick)
 	_apply_camera_beat(authority_tick)
 	_title_card.visible = tick_milli < 0
-	_winner_card.visible = authority_tick >= int(_replay.result.completion_tick)
+	_winner_card.visible = authority_tick >= _result_tick()
 	return true
 
 
 func snapshot_copy() -> Dictionary:
-	return {"task_id": MazeMap.TASK_ID, "tick_milli": _tick_milli, "configured": not _replay.is_empty()}
+	var visible_counts := {}
+	var trail_counts := {}
+	for participant_id: String in PARTICIPANTS:
+		visible_counts[participant_id] = (_visible_tile_keys.get(participant_id, {}) as Dictionary).size()
+		var shown := 0
+		for marker: Variant in _trail_markers.get(participant_id, []):
+			shown += 1 if (marker.node as Node3D).visible else 0
+		trail_counts[participant_id] = shown
+	return {
+		"task_id": MazeMap.TASK_ID,
+		"tick_milli": _tick_milli,
+		"configured": not _replay.is_empty(),
+		"map_dimensions": [_map_width, _map_height],
+		"map_start": [_map_start.x, _map_start.y],
+		"map_exit": [_map_exit.x, _map_exit.y],
+		"landmark_count": _map_landmarks.size(),
+		"maximum_ticks": _maximum_ticks,
+		"tile_scale": _tile_scale,
+		"lane_spacing": _lane_spacing,
+		"camera_far": _camera.far,
+		"overhead_camera_height": _overhead_camera_height(),
+		"visible_cell_counts": visible_counts,
+		"trail_cell_counts": trail_counts,
+	}
+
+
+func _normalise_map(value: Variant) -> Dictionary:
+	if not value is Dictionary:
+		return {}
+	var rows_value: Variant = value.get("rows", MazeMap.ROWS)
+	if not rows_value is Array or rows_value.size() < 15 or rows_value.size() > 41 \
+			or rows_value.size() % 2 == 0:
+		return {}
+	var rows: Array[String] = []
+	var width := -1
+	var start_count := 0
+	var exit_count := 0
+	for row_value: Variant in rows_value:
+		if not row_value is String:
+			return {}
+		var row := str(row_value)
+		if width < 0:
+			width = row.length()
+		if row.length() != width or width < 3 or width > 41 or width % 2 == 0:
+			return {}
+		for index: int in row.length():
+			var symbol := row.substr(index, 1)
+			if symbol not in ["#", ".", "S", "E"]:
+				return {}
+			start_count += 1 if symbol == "S" else 0
+			exit_count += 1 if symbol == "E" else 0
+		rows.append(row)
+	if start_count != 1 or exit_count != 1:
+		return {}
+	var detected_start := _find_marker(rows, "S")
+	var detected_exit := _find_marker(rows, "E")
+	var start := _parse_cell(value.get("start", []), detected_start)
+	var exit_cell := _parse_cell(value.get("exit", []), detected_exit)
+	if not _cell_is_walkable(rows, start) or not _cell_is_walkable(rows, exit_cell) \
+			or start == exit_cell:
+		return {}
+	if detected_start != Vector2i(-1, -1) and start != detected_start:
+		return {}
+	if detected_exit != Vector2i(-1, -1) and exit_cell != detected_exit:
+		return {}
+	var landmarks: Array[Dictionary] = []
+	var landmark_values: Variant = value.get("landmarks", [])
+	if not landmark_values is Array:
+		return {}
+	for landmark_value: Variant in landmark_values:
+		if not landmark_value is Dictionary:
+			return {}
+		var position := _parse_cell(landmark_value.get("position", []), Vector2i(-1, -1))
+		var label: Variant = landmark_value.get("label")
+		if not label is String or str(label).is_empty() or str(label).length() > 80 \
+				or not _cell_is_walkable(rows, position):
+			return {}
+		landmarks.append({"position": position, "label": str(label)})
+	if landmarks.is_empty() and rows == Array(MazeMap.ROWS):
+		for cell: Vector2i in MazeMap.LANDMARKS:
+			landmarks.append({"position": cell, "label": str(MazeMap.LANDMARKS[cell])})
+	return {
+		"rows": rows,
+		"start": start,
+		"exit": exit_cell,
+		"landmarks": landmarks,
+	}
+
+
+func _parse_cell(value: Variant, fallback: Vector2i) -> Vector2i:
+	if value is Array and value.size() == 2 and typeof(value[0]) == TYPE_INT \
+			and typeof(value[1]) == TYPE_INT:
+		return Vector2i(int(value[0]), int(value[1]))
+	return fallback
+
+
+func _find_marker(rows: Array[String], marker: String) -> Vector2i:
+	var found := Vector2i(-1, -1)
+	for y: int in rows.size():
+		for x: int in rows[y].length():
+			if rows[y].substr(x, 1) == marker:
+				if found != Vector2i(-1, -1):
+					return Vector2i(-1, -1)
+				found = Vector2i(x, y)
+	return found
+
+
+func _cell_is_walkable(rows: Array[String], cell: Vector2i) -> bool:
+	return cell.y >= 0 and cell.y < rows.size() and cell.x >= 0 \
+			and cell.x < rows[cell.y].length() and rows[cell.y].substr(cell.x, 1) != "#"
+
+
+func _valid_keyframe(keyframe: Dictionary, map_config: Dictionary, maximum_ticks: int) -> bool:
+	var tick: Variant = keyframe.get("tick")
+	var cell_value: Variant = keyframe.get("cell")
+	var heading: Variant = keyframe.get("heading")
+	if typeof(tick) != TYPE_INT or tick < 0 or tick > maximum_ticks \
+			or not cell_value is Array or cell_value.size() != 2 \
+			or typeof(cell_value[0]) != TYPE_INT or typeof(cell_value[1]) != TYPE_INT \
+			or typeof(heading) != TYPE_INT or heading < 0 or heading >= MazeMap.DIRECTIONS.size():
+		return false
+	var cell := Vector2i(int(cell_value[0]), int(cell_value[1]))
+	if not _cell_is_walkable(map_config.rows, cell):
+		return false
+	var visible_cells: Variant = keyframe.get("visible_cells", [])
+	if not visible_cells is Array:
+		return false
+	for visible_value: Variant in visible_cells:
+		if not visible_value is Array or visible_value.size() != 2 \
+				or typeof(visible_value[0]) != TYPE_INT or typeof(visible_value[1]) != TYPE_INT \
+				or not _cell_is_walkable(map_config.rows, Vector2i(int(visible_value[0]), int(visible_value[1]))):
+			return false
+	return true
+
+
+func _apply_map_config(map_config: Dictionary) -> void:
+	_map_rows.clear()
+	for row: Variant in map_config.rows:
+		_map_rows.append(str(row))
+	_map_start = map_config.start
+	_map_exit = map_config.exit
+	_map_landmarks.clear()
+	for landmark: Variant in map_config.landmarks:
+		_map_landmarks.append((landmark as Dictionary).duplicate(true))
+	_map_height = _map_rows.size()
+	_map_width = _map_rows[0].length()
+	_map_center = Vector2(float(_map_width - 1) / 2.0, float(_map_height - 1) / 2.0)
+	_tile_scale = clampf(15.0 / float(maxi(_map_width, _map_height)), 0.42, 1.0)
+	_lane_spacing = float(_map_width) * _tile_scale + 3.0
+	_lane_offsets = {
+		"participant_0": -_lane_spacing,
+		"participant_1": 0.0,
+		"participant_2": _lane_spacing,
+	}
 
 
 func _build() -> void:
 	if _world != null:
 		return
+	if _map_rows.is_empty():
+		_apply_map_config(_normalise_map({}))
 	_world = Node3D.new()
 	_world.name = "LabyrinthRunWorld"
 	add_child(_world)
 	_build_environment()
-	for participant_id: String in PARTICIPANTS:
-		_build_lane(participant_id)
-		_build_racer(participant_id)
 	_camera = Camera3D.new()
 	_camera.name = "LabyrinthBroadcastCamera"
 	_camera.current = true
@@ -96,8 +289,28 @@ func _build() -> void:
 	_camera.far = 140.0
 	_camera.position = Vector3(0.0, 38.0, 32.0)
 	_world.add_child(_camera)
-	_camera.look_at(Vector3(0.0, 0.0, 0.0), Vector3.UP)
+	_camera.look_at_from_position(_camera.position, Vector3.ZERO, Vector3.UP)
+	_rebuild_geometry()
 	_build_hud()
+
+
+func _rebuild_geometry() -> void:
+	if _world == null:
+		return
+	if _geometry != null:
+		_world.remove_child(_geometry)
+		_geometry.free()
+	_geometry = Node3D.new()
+	_geometry.name = "LabyrinthRaceGeometry"
+	_world.add_child(_geometry)
+	_racers.clear()
+	_visibility_tiles.clear()
+	_visible_tile_keys.clear()
+	_trail_markers.clear()
+	for participant_id: String in PARTICIPANTS:
+		_build_lane(participant_id)
+		_build_racer(participant_id)
+	_camera.far = maxf(140.0, _overhead_camera_height() * 4.0)
 
 
 func _build_environment() -> void:
@@ -133,39 +346,132 @@ func _build_environment() -> void:
 
 
 func _build_lane(participant_id: String) -> void:
-	var offset: float = LANE_OFFSETS[participant_id]
-	var lane_floor := _box("%sLaneFloor" % participant_id, Vector3(15.4, 0.08, 15.4), LANE_TONES[participant_id].darkened(0.42))
+	var offset: float = _lane_offsets[participant_id]
+	_visibility_tiles[participant_id] = {}
+	_visible_tile_keys[participant_id] = {}
+	_trail_markers[participant_id] = []
+	var lane_floor := _box(
+		"%sLaneFloor" % participant_id,
+		Vector3(float(_map_width) * _tile_scale + 0.4, 0.08, float(_map_height) * _tile_scale + 0.4),
+		LANE_TONES[participant_id].darkened(0.42),
+	)
 	lane_floor.position = Vector3(offset, -0.01, 0.0)
-	_world.add_child(lane_floor)
-	for y: int in MazeMap.ROWS.size():
-		for x: int in MazeMap.ROWS[y].length():
-			if MazeMap.ROWS[y][x] != "#":
+	_geometry.add_child(lane_floor)
+	for y: int in _map_rows.size():
+		for x: int in _map_rows[y].length():
+			if _map_rows[y].substr(x, 1) != "#":
+				var sight := _box(
+					"%sSight_%d_%d" % [participant_id, x, y],
+					Vector3(0.84 * _tile_scale, 0.035, 0.84 * _tile_scale),
+					Color("ffd45a"),
+				)
+				sight.position = _world_position(participant_id, Vector2(x, y)) + Vector3(0.0, 0.035, 0.0)
+				sight.material_override = _visibility_material()
+				sight.visible = false
+				_geometry.add_child(sight)
+				(_visibility_tiles[participant_id] as Dictionary)[_cell_key(Vector2i(x, y))] = sight
 				continue
-			var wall := _box("MazeWall", Vector3(0.92, 1.1, 0.92), Color("51614f"))
-			wall.position = Vector3(offset + float(x - 7), 0.55, float(y - 7))
-			_world.add_child(wall)
+			var wall_height := 1.1 * maxf(_tile_scale, 0.55)
+			var wall := _box(
+				"MazeWall",
+				Vector3(0.92 * _tile_scale, wall_height, 0.92 * _tile_scale),
+				Color("51614f"),
+			)
+			wall.position = _world_position(participant_id, Vector2(x, y)) + Vector3(0.0, wall_height / 2.0, 0.0)
+			_geometry.add_child(wall)
 			if (x + y) % 4 == 0:
-				var hedge := _box("MazeHedge", Vector3(0.78, 0.35, 0.78), LANE_TONES[participant_id].lightened(0.12))
-				hedge.position = wall.position + Vector3(0.0, 0.67, 0.0)
-				_world.add_child(hedge)
+				var hedge := _box(
+					"MazeHedge",
+					Vector3(0.78 * _tile_scale, 0.35 * maxf(_tile_scale, 0.55), 0.78 * _tile_scale),
+					LANE_TONES[participant_id].lightened(0.12),
+				)
+				hedge.position = wall.position + Vector3(0.0, wall_height * 0.61, 0.0)
+				_geometry.add_child(hedge)
 	var start_banner := _lane_banner(participant_id)
-	start_banner.position = Vector3(offset, 0.0, 7.6)
-	_world.add_child(start_banner)
+	start_banner.scale = Vector3.ONE * maxf(_tile_scale, 0.55)
+	start_banner.position = _world_position(participant_id, Vector2(_map_start)) + Vector3(0.0, 0.0, 1.6 * _tile_scale)
+	_geometry.add_child(start_banner)
 	var exit_arch := _exit_arch(participant_id)
-	exit_arch.position = Vector3(offset, 0.0, -6.0)
-	_world.add_child(exit_arch)
+	exit_arch.scale = Vector3.ONE * maxf(_tile_scale, 0.55)
+	exit_arch.position = _world_position(participant_id, Vector2(_map_exit))
+	_geometry.add_child(exit_arch)
 	_build_landmarks(participant_id)
 
 
 func _build_landmarks(participant_id: String) -> void:
-	var offset: float = LANE_OFFSETS[participant_id]
-	for cell: Vector2i in MazeMap.LANDMARKS:
-		var marker := _sphere("Landmark", 0.22, Color("62d9ff"))
-		marker.position = Vector3(offset + float(cell.x - 7), 0.35, float(cell.y - 7))
+	for landmark: Dictionary in _map_landmarks:
+		var cell: Vector2i = landmark.position
+		var marker := _sphere("Landmark", 0.22 * maxf(_tile_scale, 0.65), Color("62d9ff"))
+		marker.position = _world_position(participant_id, Vector2(cell)) + Vector3(0.0, 0.35, 0.0)
 		var material := marker.material_override as StandardMaterial3D
 		material.emission_enabled = true
 		material.emission = Color("2d8ca8")
-		_world.add_child(marker)
+		_geometry.add_child(marker)
+
+
+func _build_trails() -> void:
+	for participant_id: String in PARTICIPANTS:
+		for marker: Variant in _trail_markers.get(participant_id, []):
+			(marker.node as Node3D).queue_free()
+		_trail_markers[participant_id] = []
+	for racer_value: Variant in _replay.racers:
+		var racer: Dictionary = racer_value
+		var participant_id := str(racer.participant_id)
+		var keyframes: Array = racer.keyframes
+		var previous := Vector2i(int(keyframes[0].cell[0]), int(keyframes[0].cell[1]))
+		var step_index := 0
+		for index: int in range(1, keyframes.size()):
+			var frame: Dictionary = keyframes[index]
+			var cell := Vector2i(int(frame.cell[0]), int(frame.cell[1]))
+			if cell == previous:
+				continue
+			var root := Node3D.new()
+			root.name = "%sFootsteps_%03d" % [participant_id, step_index]
+			root.position = _world_position(participant_id, Vector2(cell.x, cell.y)) + Vector3(0.0, 0.075, 0.0)
+			var heading := int(frame.heading)
+			var direction: Vector2i = MazeMap.DIRECTIONS[heading]
+			var forward := Vector3(float(direction.x), 0.0, float(direction.y))
+			var lateral := Vector3(-forward.z, 0.0, forward.x) * 0.13
+			var color := Color(str(racer.color)).lightened(0.18)
+			for foot_index: int in 2:
+				var foot := _sphere("Footprint", 0.11, color)
+				foot.scale = Vector3(0.62, 0.16, 1.35)
+				foot.position = lateral * (-1.0 if foot_index == 0 else 1.0) + forward * (-0.12 if foot_index == 0 else 0.12)
+				var material := foot.material_override as StandardMaterial3D
+				material.emission_enabled = true
+				material.emission = color.darkened(0.15)
+				root.add_child(foot)
+			root.visible = false
+			_geometry.add_child(root)
+			(_trail_markers[participant_id] as Array).append({"node": root, "tick": int(frame.tick)})
+			previous = cell
+			step_index += 1
+
+
+func _apply_visibility(participant_id: String, visible_cells: Array) -> void:
+	var next_keys := {}
+	for cell_value: Variant in visible_cells:
+		if not cell_value is Array or cell_value.size() != 2:
+			continue
+		next_keys[_cell_key(Vector2i(int(cell_value[0]), int(cell_value[1])))] = true
+	var previous: Dictionary = _visible_tile_keys[participant_id]
+	var tiles: Dictionary = _visibility_tiles[participant_id]
+	for key: Variant in previous:
+		if not next_keys.has(key) and tiles.has(key):
+			(tiles[key] as MeshInstance3D).visible = false
+	for key: Variant in next_keys:
+		if not previous.has(key) and tiles.has(key):
+			(tiles[key] as MeshInstance3D).visible = true
+	_visible_tile_keys[participant_id] = next_keys
+
+
+func _apply_trail(participant_id: String, tick: int) -> void:
+	for marker: Variant in _trail_markers[participant_id]:
+		(marker.node as Node3D).visible = int(marker.tick) <= tick
+
+
+func _cell_key(cell: Vector2i) -> String:
+	return "%d:%d" % [cell.x, cell.y]
 
 
 func _build_racer(participant_id: String) -> void:
@@ -176,8 +482,9 @@ func _build_racer(participant_id: String) -> void:
 		tree.tree_root = tree.tree_root.duplicate(true)
 	var entrant_id: String = {"participant_0": "sol", "participant_1": "luna", "participant_2": "terra"}[participant_id]
 	EntrantPalette.tint_avatar(actor, entrant_id)
-	actor.scale = Vector3(0.72, 0.72, 0.72)
-	actor.position = _world_position(participant_id, Vector2(7, 13))
+	var actor_scale := 0.72 * maxf(_tile_scale, 0.58)
+	actor.scale = Vector3.ONE * actor_scale
+	actor.position = _world_position(participant_id, Vector2(_map_start))
 	var label := Label3D.new()
 	label.name = "RacerLabel"
 	label.position.y = 3.2
@@ -194,7 +501,7 @@ func _build_racer(participant_id: String) -> void:
 	speech.font_size = 28
 	speech.modulate = Color("fff5d8")
 	actor.add_child(speech)
-	_world.add_child(actor)
+	_geometry.add_child(actor)
 	_racers[participant_id] = actor
 
 
@@ -258,10 +565,13 @@ func _winner_card_copy() -> String:
 
 
 func _update_hud(tick: int) -> void:
-	var remaining := maxi(0, 600 - tick)
+	var remaining := maxi(0, _maximum_ticks - tick)
 	var remaining_seconds := ceili(float(remaining) / 10.0)
-	var lines := "[font_size=22][b]LABYRINTH RUN[/b]  [color=#8be9fd]%02d:%02d[/color][/font_size]     " % [remaining_seconds / 60, remaining_seconds % 60]
-	lines += "[color=#fbbf24][b]● SOL[/b][/color] demo-sol-v1     [color=#a78bfa][b]● LUNA[/b][/color] demo-luna-v1     [color=#34d399][b]● TERRA[/b][/color] demo-terra-v1\n"
+	var lines := "[font_size=22][b]LABYRINTH RUN[/b]  [color=#8be9fd]%02d:%02d[/color]  [color=#ffd45a]VISION %s[/color][/font_size]     " % [remaining_seconds / 60, remaining_seconds % 60, _vision_label()]
+	for racer_value: Variant in _replay.racers:
+		var entrant: Dictionary = racer_value
+		lines += "[color=%s][b]● %s[/b][/color] %s     " % [str(entrant.color), str(entrant.display_name).to_upper(), str(entrant.model)]
+	lines += "\n"
 	for value: Variant in _replay.racers:
 		var racer: Dictionary = value
 		var progress := _progress_at(racer, tick)
@@ -279,10 +589,13 @@ func _progress_at(racer: Dictionary, tick: int) -> Dictionary:
 	var keyframes: Array = racer.keyframes
 	var distance := 0
 	var task := "exploring"
+	var previous_cell := Vector2i(int(keyframes[0].cell[0]), int(keyframes[0].cell[1]))
 	for value: Variant in keyframes:
 		if int(value.tick) > tick:
 			break
-		distance += 1 if int(value.tick) > 0 else 0
+		var cell := Vector2i(int(value.cell[0]), int(value.cell[1]))
+		distance += 1 if cell != previous_cell else 0
+		previous_cell = cell
 		task = str(value.task)
 	var passages := 0
 	var dead_ends := 0
@@ -314,6 +627,7 @@ func _pose_at(keyframes: Array, tick_milli: int) -> Dictionary:
 		"heading": int(after.heading),
 		"animation": "hit" if state == "surprised" else "celebrate" if state == "celebrate" else "walk" if moving or state == "walk" else "idle",
 		"task": str(after.task if moving else before.task),
+		"visible_cells": before.get("visible_cells", []),
 	}
 
 
@@ -326,42 +640,50 @@ func _safe_event_label(participant_id: String, tick: int) -> String:
 
 
 func _apply_camera_beat(tick: int) -> void:
-	var position := Vector3(0.0, 38.0, 32.0)
+	var overhead_height := _overhead_camera_height()
+	var arena_depth := float(_map_height) * _tile_scale
+	var position := Vector3(0.0, overhead_height, arena_depth * 2.15)
 	var target := Vector3(0.0, 0.0, 0.0)
 	var label := "IDENTICAL LANES · EQUAL MOVEMENT SPEED · PRIVATE VISION"
-	if tick < 100:
-		position = Vector3(0.0, 22.0, 26.0)
-		target = Vector3(0.0, 0.0, 5.0)
+	var progress := float(tick) / float(maxi(1, _maximum_ticks))
+	if progress < 1.0 / 6.0:
+		position = Vector3(0.0, overhead_height * 0.58, arena_depth * 1.72)
+		target = Vector3(0.0, 0.0, arena_depth * 0.33)
 		label = "THE GATES OPEN · THREE INDEPENDENT SEARCHES"
-	elif tick < 300:
+	elif progress < 0.5:
 		label = "OVERHEAD COMPARISON · POLICIES DIVERGE"
-	elif tick < 420:
-		position = Vector3(9.0, 15.0, 14.0)
-		target = Vector3(9.0, 0.0, 0.0)
-		label = "LUNA AND TERRA TEST WRONG PASSAGES"
-	elif tick < 480:
-		position = Vector3(-18.0, 10.0, -13.0)
-		target = Vector3(-18.0, 0.0, -5.0)
-		label = "SOL FINDS THE EXIT FIRST"
-	elif tick < 550:
-		position = Vector3(18.0, 10.0, -13.0)
-		target = Vector3(18.0, 0.0, -5.0)
-		label = "TERRA RECOVERS · SECOND PLACE"
+	elif progress < 0.7:
+		position = Vector3(_lane_spacing * 0.5, overhead_height * 0.4, arena_depth * 0.92)
+		target = Vector3(_lane_spacing * 0.5, 0.0, 0.0)
+		label = "GOLD TILES SHOW EXACT AGENT SIGHTLINES"
+	elif progress < 0.8:
+		position = Vector3(float(_lane_offsets.participant_0), overhead_height * 0.27, -arena_depth * 0.86)
+		target = Vector3(float(_lane_offsets.participant_0), 0.0, -arena_depth * 0.33)
+		label = "FOOTSTEPS PRESERVE EVERY EXECUTED CELL"
+	elif progress < 11.0 / 12.0:
+		position = Vector3(float(_lane_offsets.participant_2), overhead_height * 0.27, -arena_depth * 0.86)
+		target = Vector3(float(_lane_offsets.participant_2), 0.0, -arena_depth * 0.33)
+		label = "CORRIDOR COMMANDS STOP BEFORE ROUTE CHOICES"
 	else:
-		position = Vector3(0.0, 11.0, -13.0)
-		target = Vector3(0.0, 0.0, -5.0)
-		label = "LUNA BACKTRACKS AND ESCAPES BEFORE TIME"
-	if tick >= int(_replay.result.completion_tick):
-		position = Vector3(0.0, 31.0, 29.0)
-		target = Vector3(0.0, 0.0, -2.0)
-		label = "FINAL PODIUM · SOL WINS ON PATH EFFICIENCY"
-	_camera.position = position
-	_camera.look_at(target, Vector3.UP)
+		position = Vector3(0.0, overhead_height * 0.29, -arena_depth * 0.86)
+		target = Vector3(0.0, 0.0, -arena_depth * 0.33)
+		label = "PRIVATE MEMORIES · PUBLIC PHYSICAL TRAILS"
+	if tick >= _result_tick():
+		position = Vector3(0.0, overhead_height * 0.82, arena_depth * 1.92)
+		target = Vector3(0.0, 0.0, -arena_depth * 0.13)
+		label = "FINAL VERIFIED PODIUM"
+	_camera.look_at_from_position(position, target, Vector3.UP)
 	_beat.text = label
+
+
+func _result_tick() -> int:
+	return int(_replay.result.get("completion_tick", 0)) \
+			if _replay.result.get("reason") == "all_racers_finished" else _maximum_ticks
 
 
 func _lane_banner(participant_id: String) -> Node3D:
 	var root := Node3D.new()
+	root.name = "%sBanner" % participant_id
 	var post := _box("BannerPost", Vector3(0.18, 2.5, 0.18), Color("5a4431"))
 	post.position.y = 1.25
 	root.add_child(post)
@@ -369,6 +691,7 @@ func _lane_banner(participant_id: String) -> Node3D:
 	banner.position = Vector3(0.0, 2.0, 0.0)
 	root.add_child(banner)
 	var label := Label3D.new()
+	label.name = "Label"
 	label.text = _display_name(participant_id).to_upper()
 	label.position = Vector3(0.0, 2.0, -0.08)
 	label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
@@ -406,11 +729,34 @@ func _overlay_card(layer: CanvasLayer, position: Vector2, size: Vector2, color: 
 
 
 func _world_position(participant_id: String, cell: Vector2) -> Vector3:
-	return Vector3(float(LANE_OFFSETS[participant_id]) + cell.x - 7.0, 0.0, cell.y - 7.0)
+	return Vector3(
+		float(_lane_offsets[participant_id]) + (cell.x - _map_center.x) * _tile_scale,
+		0.0,
+		(cell.y - _map_center.y) * _tile_scale,
+	)
+
+
+func _overhead_camera_height() -> float:
+	var arena_width := 2.0 * _lane_spacing + float(_map_width) * _tile_scale
+	var arena_depth := float(_map_height) * _tile_scale
+	return maxf(38.0, maxf(arena_width * 0.74, arena_depth * 1.9))
 
 
 func _display_name(participant_id: String) -> String:
+	if not _replay.is_empty():
+		for racer_value: Variant in _replay.racers:
+			var racer: Dictionary = racer_value
+			if racer.participant_id == participant_id:
+				return str(racer.display_name)
 	return {"participant_0": "Sol", "participant_1": "Luna", "participant_2": "Terra"}.get(participant_id, "Agent")
+
+
+func _vision_label() -> String:
+	if not _replay.get("vision") is Dictionary:
+		return "UNKNOWN"
+	var value: Variant = _replay.vision.get("range_cells", "unknown")
+	return "∞ TO WALL" if typeof(value) == TYPE_STRING and str(value) == "infinite" \
+			else "%s CELLS" % str(value)
 
 
 func _box(name: String, size: Vector3, color: Color) -> MeshInstance3D:
@@ -438,4 +784,15 @@ func _material(color: Color) -> StandardMaterial3D:
 	var material := StandardMaterial3D.new()
 	material.albedo_color = color
 	material.roughness = 0.82
+	return material
+
+
+func _visibility_material() -> StandardMaterial3D:
+	var material := StandardMaterial3D.new()
+	material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	material.albedo_color = Color(1.0, 0.78, 0.20, 0.42)
+	material.emission_enabled = true
+	material.emission = Color("b67b13")
+	material.emission_energy_multiplier = 0.72
+	material.roughness = 0.7
 	return material

@@ -35,6 +35,8 @@ from .episode_service import (
 )
 from .labyrinth_run import CachedLabyrinthRun
 from .live_labyrinth import (
+    DEFAULT_VISION_RANGE_CELLS,
+    MAX_FINITE_VISION_RANGE_CELLS,
     MAX_LIVE_PROVIDER_CALLS,
     LiveLabyrinthNotFoundError,
     LiveLabyrinthNotReadyError,
@@ -281,6 +283,7 @@ async def create_live_maze_race(
             entrants=values["entrants"],
             providers=adapters,
             max_provider_calls=values["max_provider_calls"],
+            vision_range_cells=values["vision_range_cells"],
             cleanup=cleanup,
         )
     except (TypeError, ValueError):
@@ -338,8 +341,6 @@ async def cancel_live_maze_race(request: Request, episode_id: str) -> Mapping[st
         return await _live_labyrinth_service(request).cancel(episode_id)
     except LiveLabyrinthNotFoundError:
         raise HTTPException(status_code=404, detail={"code": "live_maze_race_not_found"}) from None
-
-
 
 
 @router.get("/api/embodiment/episodes/{episode_id}")
@@ -1105,7 +1106,13 @@ def _validate_series_payload(payload: Any) -> dict[str, Any]:
 
 def _validate_live_maze_payload(payload: Any) -> dict[str, Any]:
     """Validate the shared-key, three-slot live maze request without echoing a key."""
-    allowed = {"provider", "api_key", "entrants", "max_provider_calls"}
+    allowed = {
+        "provider",
+        "api_key",
+        "entrants",
+        "max_provider_calls",
+        "vision_range_cells",
+    }
     if not isinstance(payload, dict) or set(payload) - allowed:
         raise ValueError("invalid live maze payload")
     provider = payload.get("provider")
@@ -1148,11 +1155,19 @@ def _validate_live_maze_payload(payload: Any) -> dict[str, Any]:
         or not 1 <= max_provider_calls <= MAX_LIVE_PROVIDER_CALLS
     ):
         raise ValueError("invalid live maze call budget")
+    vision_range_cells = payload.get("vision_range_cells", DEFAULT_VISION_RANGE_CELLS)
+    if vision_range_cells != "infinite" and (
+        isinstance(vision_range_cells, bool)
+        or not isinstance(vision_range_cells, int)
+        or not 1 <= vision_range_cells <= MAX_FINITE_VISION_RANGE_CELLS
+    ):
+        raise ValueError("invalid live maze vision range")
     return {
         "provider": provider,
         "api_key": api_key,
         "entrants": tuple(normalized),
         "max_provider_calls": max_provider_calls,
+        "vision_range_cells": vision_range_cells,
     }
 
 

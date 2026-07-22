@@ -99,7 +99,7 @@ def response(output_text='{"action":"move"}', *, output=None):
         usage=SimpleNamespace(
             input_tokens=23,
             output_tokens=7,
-            input_tokens_details=SimpleNamespace(cached_tokens=3),
+            input_tokens_details=SimpleNamespace(cached_tokens=3, cache_write_tokens=5),
         ),
         _request_id="req-secret-provider-id",
     )
@@ -155,6 +155,8 @@ async def test_success_builds_private_retry_free_responses_payload_and_audit():
     assert result.telemetry.input_tokens == 23
     assert result.telemetry.output_tokens == 7
     assert result.telemetry.cached_input_tokens == 3
+    assert result.telemetry.cache_write_tokens == 5
+    assert result.telemetry.as_dict()["cache_write_tokens"] == 5
     assert len(result.telemetry.request_id_sha256) == 64
     assert len(client.responses.calls) == 1
     payload = client.responses.calls[0]
@@ -177,6 +179,7 @@ async def test_success_builds_private_retry_free_responses_payload_and_audit():
     assert content[1]["detail"] == "high"
     assert payload["reasoning"] == {"effort": "low"}
     assert payload["max_output_tokens"] == 2048
+    assert "service_tier" not in payload
     serialized = repr(payload)
     assert "spectator" not in serialized
     assert "opponent" not in serialized
@@ -228,6 +231,39 @@ async def test_provider_failures_are_sanitized_without_retry(error, expected):
     assert "secret" not in repr(result)
     assert len(client.responses.calls) == 1
     assert audit.drain_episode("episode-1")[0].result == result
+
+
+@pytest.mark.asyncio
+async def test_quota_429_is_distinct_from_transient_rate_limit():
+    quota = type(
+        "RateLimitError",
+        (Exception,),
+        {"status_code": 429, "body": {"error": {"code": "insufficient_quota"}}},
+    )("protected provider message")
+    adapter = OpenAIProviderAdapter(client=FakeClient(quota), monotonic_ns=Clock(100, 200))
+
+    result = await adapter.request(request(deadline_monotonic_ns=1_000))
+
+    assert result.failure is ProviderFailureKind.QUOTA
+
+
+@pytest.mark.asyncio
+async def test_explicit_default_service_tier_is_sent_only_when_requested():
+    client = FakeClient(response())
+    adapter = OpenAIProviderAdapter(
+        client=client,
+        service_tier="default",
+        monotonic_ns=Clock(100, 200),
+    )
+
+    await adapter.request(request(deadline_monotonic_ns=1_000))
+
+    assert client.responses.calls[0]["service_tier"] == "default"
+
+
+def test_invalid_service_tier_is_rejected():
+    with pytest.raises(ValueError, match="service_tier"):
+        OpenAIProviderAdapter(client=FakeClient(response()), service_tier="turbo")
 
 
 @pytest.mark.asyncio

@@ -23,6 +23,10 @@ from .embodiment.api import router as embodiment_router
 from .embodiment.crossroads_conquest import CachedCrossroadsShowcase, CrossroadsShowcaseError
 from .embodiment.dashboard import mount_built_dashboard
 from .embodiment.duel.live_runtime import default_duel_series_service
+from .embodiment.lab.benchmarks import BenchmarkStore
+from .embodiment.lab.game_authority import GameAuthorityGateway
+from .embodiment.lab.game_runs import GenericLabRunService
+from .embodiment.lab.publications import PublicReplayStore
 from .embodiment.lab.service import LabRunService
 from .embodiment.lab_api import public_router as public_lab_router
 from .embodiment.lab_api import router as lab_router
@@ -106,6 +110,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ffmpeg_executable=settings.ffmpeg_executable,
         preview_ingress=app.state.embodiment_preview_ingress,
     )
+    app.state.lab_game_runs = GenericLabRunService(
+        runs_dir=settings.runs_dir,
+        authority=GameAuthorityGateway(
+            solo=app.state.embodiment_episodes,
+            paired=app.state.embodiment_series,
+            trio=app.state.embodiment_trio_series,
+        ),
+    )
     # Live Labyrinth Run is intentionally a separate v1 lifecycle from the cached showcase
     # and the keyless trio demo service.
     from .embodiment.live_labyrinth import LiveLabyrinthService
@@ -125,6 +137,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         runs_dir=settings.runs_dir,
         live_labyrinth=app.state.embodiment_live_labyrinth,
     )
+    app.state.lab_benchmarks = BenchmarkStore(runs_dir=settings.runs_dir)
+    app.state.lab_public_replays = PublicReplayStore(runs_dir=settings.runs_dir)
     # The Lab has an explicit loopback-only local mode for the desktop launcher
     # and fails closed if a production magic-link configuration is incomplete.
     # No provider credential is ever part of this identity state.

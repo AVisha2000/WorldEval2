@@ -53,6 +53,26 @@ class FakeLiveLabyrinth:
     async def replay(self, episode_id: str) -> Mapping[str, Any]:
         return self.replays[episode_id]
 
+    async def benchmark_metrics(self, episode_id: str) -> tuple[Mapping[str, object], ...]:
+        if episode_id not in self.replays:
+            raise KeyError(episode_id)
+        return tuple(
+            {
+                "entrant_id": f"entrant_{index}",
+                "metrics": {
+                    "budget_charged_calls": 1,
+                    "completion_basis_points": 10_000,
+                    "input_tokens": 10 + index,
+                    "invalid_action_rate_basis_points": 0,
+                    "latency_ms": 20 + index,
+                    "output_tokens": 5 + index,
+                    "path_efficiency_basis_points": 9_000,
+                    "recovery_rate_basis_points": 0,
+                },
+            }
+            for index in range(3)
+        )
+
     async def video_path(self, episode_id: str) -> Path | None:
         return self.video_paths.get(episode_id)
 
@@ -75,6 +95,11 @@ class FakeLiveLabyrinth:
 
     async def cancel(self, episode_id: str) -> Mapping[str, object]:
         self.cancelled.append(episode_id)
+        self.statuses[episode_id] = {
+            "episode_id": episode_id,
+            "failure": "lab_run_cancelled",
+            "state": "cancelled",
+        }
         return {"episode_id": episode_id, "state": "cancelled"}
 
 
@@ -131,6 +156,60 @@ def _public_fast_start_mp4() -> bytes:
 def _write_public_fast_start_mp4(path: Path) -> Path:
     path.write_bytes(_public_fast_start_mp4())
     return path
+
+
+@pytest.mark.asyncio
+async def test_labyrinth_lab_run_cancel_uses_private_authority_handle(
+    tmp_path: Path,
+) -> None:
+    source = FakeLiveLabyrinth()
+    service = LabRunService(runs_dir=tmp_path, live_labyrinth=source)
+    created = await service.create_live_labyrinth(
+        episode_id="ep_labyrinth_cancel_001",
+        entrants=_entrants(),
+        provider_call_budget=450,
+        vision_range_cells=4,
+        skill_mode="none",
+    )
+    cancelled = await service.cancel(created["run_id"])
+    assert source.cancelled == ["ep_labyrinth_cancel_001"]
+    assert cancelled["state"]["status"] == "cancelled"
+    assert cancelled["state"]["failure_code"] == "lab_run_cancelled"
+    assert "ep_labyrinth_cancel_001" not in str(cancelled)
+
+
+@pytest.mark.asyncio
+async def test_labyrinth_lab_run_does_not_invent_cancellation_after_authority_sealed(
+    tmp_path: Path,
+) -> None:
+    source = FakeLiveLabyrinth()
+    episode_id = "ep_labyrinth_cancel_too_late"
+
+    async def too_late_cancel(requested_episode_id: str) -> Mapping[str, object]:
+        source.cancelled.append(requested_episode_id)
+        return {"episode_id": requested_episode_id, "state": "running"}
+
+    source.cancel = too_late_cancel  # type: ignore[method-assign]
+    service = LabRunService(runs_dir=tmp_path, live_labyrinth=source)
+    created = await service.create_live_labyrinth(
+        episode_id=episode_id,
+        entrants=_entrants(),
+        provider_call_budget=450,
+        vision_range_cells=4,
+        skill_mode="none",
+    )
+    source.statuses[episode_id] = {"state": "running", "failure": None}
+    assert (await service.get_run(created["run_id"]))["state"]["status"] == "running"
+
+    pending = await service.cancel(created["run_id"])
+
+    assert pending["state"]["status"] == "running"
+    assert source.cancelled == [episode_id]
+    source.replays[episode_id] = _safe_replay()
+    source.statuses[episode_id] = {"state": "completed", "failure": None}
+    completed = await service.get_run(created["run_id"])
+    assert completed["state"]["status"] == "completed"
+    assert completed["state"]["failure_code"] is None
 
 
 def _safe_spectator_frame(
@@ -251,12 +330,81 @@ async def test_lab_run_service_persists_only_safe_public_contract_projection_and
     assert projection["events"] == _safe_replay()["events"]
     assert completed["cartridge"]["authority_checkpoint_sha256"] is None
 
+    sealed = await service.seal(run_id)
+    assert sealed["state"]["status"] == "sealed"
+    assert sealed["replay_available"] is True
+    verified = await service.verify(run_id)
+    assert verified["state"]["status"] == "verified"
+    assert verified["cartridge"]["public_projection"]["status"] == "verified"
+    verified_projection = await service.projection(run_id)
+
     reloaded = LabRunService(runs_dir=tmp_path, live_labyrinth=source)
     loaded = await reloaded.get_run(run_id)
-    assert loaded["state"]["status"] == "completed"
+    assert loaded["state"]["status"] == "verified"
     assert loaded["authority_available"] is False
     reloaded_projection = await reloaded.projection(run_id)
-    assert reloaded_projection["projection_sha256"] == projection["projection_sha256"]
+    assert reloaded_projection["projection_sha256"] == verified_projection["projection_sha256"]
+
+
+@pytest.mark.asyncio
+async def test_labyrinth_evidence_lifecycle_swaps_only_after_durable_readback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = FakeLiveLabyrinth()
+    service = LabRunService(runs_dir=tmp_path, live_labyrinth=source)
+    episode_id = "ep_labyrinth_transactional_evidence_001"
+    created = await service.create_live_labyrinth(
+        episode_id=episode_id,
+        entrants=_entrants(),
+        provider_call_budget=450,
+        vision_range_cells=4,
+        skill_mode="none",
+    )
+    run_id = str(created["run_id"])
+    source.statuses[episode_id] = {"state": "completed", "failure": None}
+    source.replays[episode_id] = _safe_replay()
+    assert (await service.get_run(run_id))["state"]["status"] == "completed"
+
+    original_persist = service._persist
+
+    def fail_sealed(record: Any) -> None:
+        if record.state.status.value == "sealed":
+            raise OSError("fixture seal persistence failure")
+        original_persist(record)
+
+    monkeypatch.setattr(service, "_persist", fail_sealed)
+    with pytest.raises(LabRunError, match="could not be persisted"):
+        await service.seal(run_id)
+    assert (await service.get_run(run_id))["state"]["status"] == "completed"
+
+    monkeypatch.setattr(service, "_persist", original_persist)
+    assert (await service.seal(run_id))["state"]["status"] == "sealed"
+
+    def fail_verified(record: Any) -> None:
+        if record.state.status.value == "verified":
+            raise OSError("fixture verify persistence failure")
+        original_persist(record)
+
+    monkeypatch.setattr(service, "_persist", fail_verified)
+    with pytest.raises(LabRunError, match="could not be persisted"):
+        await service.verify(run_id)
+    assert (await service.get_run(run_id))["state"]["status"] == "sealed"
+
+    monkeypatch.setattr(service, "_persist", original_persist)
+    assert (await service.verify(run_id))["state"]["status"] == "verified"
+
+    original_readback = service._read_durable_record
+    readbacks = 0
+
+    def observe_readback(directory: Path) -> Any:
+        nonlocal readbacks
+        readbacks += 1
+        return original_readback(directory)
+
+    monkeypatch.setattr(service, "_read_durable_record", observe_readback)
+    assert (await service.verify(run_id))["state"]["status"] == "verified"
+    assert readbacks == 1
 
 
 @pytest.mark.asyncio
@@ -308,6 +456,56 @@ async def test_completed_labyrinth_archives_a_public_video_and_reloads_without_e
     assert loaded["authority_available"] is False
     assert loaded["video_available"] is True
     assert await reloaded.video_path(run_id) == archived
+
+
+@pytest.mark.asyncio
+async def test_archived_labyrinth_video_survives_seal_verify_and_each_restart(
+    tmp_path: Path,
+) -> None:
+    source = FakeLiveLabyrinth()
+    service = LabRunService(runs_dir=tmp_path, live_labyrinth=source)
+    episode_id = "ep_labyrinth_video_evidence_lifecycle_001"
+    created = await service.create_live_labyrinth(
+        episode_id=episode_id,
+        entrants=_entrants(),
+        provider_call_budget=450,
+        vision_range_cells=4,
+        skill_mode="none",
+    )
+    run_id = str(created["run_id"])
+    source.statuses[episode_id] = {
+        "state": "completed",
+        "failure": None,
+        "video": {"state": "ready"},
+    }
+    source.replays[episode_id] = _safe_replay()
+    source.video_paths[episode_id] = _write_public_fast_start_mp4(
+        tmp_path / "lifecycle-source.mp4"
+    )
+    archive = tmp_path / "lab" / run_id / "labyrinth-run-broadcast.mp4"
+
+    assert (await service.get_run(run_id))["video_available"] is True
+    sealed = await service.seal(run_id)
+    assert sealed["state"]["status"] == "sealed"
+    assert sealed["video_available"] is True
+    assert await service.video_path(run_id) == archive
+
+    after_seal_restart = LabRunService(runs_dir=tmp_path)
+    sealed_reloaded = await after_seal_restart.get_run(run_id)
+    assert sealed_reloaded["state"]["status"] == "sealed"
+    assert sealed_reloaded["video_available"] is True
+    assert await after_seal_restart.video_path(run_id) == archive
+
+    verified = await after_seal_restart.verify(run_id)
+    assert verified["state"]["status"] == "verified"
+    assert verified["video_available"] is True
+    assert await after_seal_restart.video_path(run_id) == archive
+
+    after_verify_restart = LabRunService(runs_dir=tmp_path)
+    verified_reloaded = await after_verify_restart.get_run(run_id)
+    assert verified_reloaded["state"]["status"] == "verified"
+    assert verified_reloaded["video_available"] is True
+    assert await after_verify_restart.video_path(run_id) == archive
 
 
 @pytest.mark.asyncio
@@ -436,6 +634,67 @@ def test_lab_video_route_serves_only_the_durable_archived_mp4_by_run_id(tmp_path
     assert episode_id.encode("utf-8") not in response.content
     assert unavailable.status_code == 404
     assert unavailable.json() == {"detail": {"code": "lab_run_not_found"}}
+
+
+def test_lab_video_route_survives_seal_verify_and_service_restart(tmp_path: Path) -> None:
+    source = FakeLiveLabyrinth()
+    service = _lab_service_for_client(tmp_path, source)
+    episode_id = "ep_labyrinth_video_http_lifecycle_001"
+
+    async def create_completed_run() -> str:
+        created = await service.create_live_labyrinth(
+            episode_id=episode_id,
+            entrants=_entrants(),
+            provider_call_budget=450,
+            vision_range_cells=4,
+            skill_mode="none",
+        )
+        source.statuses[episode_id] = {
+            "state": "completed",
+            "failure": None,
+            "video": {"state": "ready"},
+        }
+        source.replays[episode_id] = _safe_replay()
+        source.video_paths[episode_id] = _write_public_fast_start_mp4(
+            tmp_path / "http-lifecycle-source.mp4"
+        )
+        await service.get_run(str(created["run_id"]))
+        return str(created["run_id"])
+
+    run_id = asyncio.run(create_completed_run())
+    app = FastAPI()
+    app.state.lab_runs = service
+    app.include_router(router)
+    with TestClient(app) as client:
+        sealed = client.post(f"/api/lab/runs/{run_id}/seal")
+        sealed_video = client.get(f"/api/lab/runs/{run_id}/video")
+        verified = client.post(f"/api/lab/runs/{run_id}/verify")
+        verified_video = client.get(f"/api/lab/runs/{run_id}/video")
+
+    assert sealed.status_code == 200
+    assert sealed.json()["state"]["status"] == "sealed"
+    assert sealed.json()["video_available"] is True
+    assert sealed_video.status_code == 200
+    assert sealed_video.content == _public_fast_start_mp4()
+    assert verified.status_code == 200
+    assert verified.json()["state"]["status"] == "verified"
+    assert verified.json()["video_available"] is True
+    assert verified_video.status_code == 200
+    assert verified_video.content == _public_fast_start_mp4()
+
+    restarted_app = FastAPI()
+    restarted_app.state.lab_runs = _lab_service_for_client(tmp_path, FakeLiveLabyrinth())
+    restarted_app.include_router(router)
+    with TestClient(restarted_app) as client:
+        reloaded = client.get(f"/api/lab/runs/{run_id}")
+        restarted_video = client.get(f"/api/lab/runs/{run_id}/video")
+
+    assert reloaded.status_code == 200
+    assert reloaded.json()["state"]["status"] == "verified"
+    assert reloaded.json()["video_available"] is True
+    assert restarted_video.status_code == 200
+    assert restarted_video.headers["content-type"].startswith("video/mp4")
+    assert restarted_video.content == _public_fast_start_mp4()
 
 
 @pytest.mark.asyncio

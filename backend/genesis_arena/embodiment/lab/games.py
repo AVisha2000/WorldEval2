@@ -14,14 +14,32 @@ from typing import Literal, Mapping
 
 from ..protocol import canonical_json_bytes, canonical_sha256
 
-GAME_SPEC_SCHEMA_VERSION = "worldeval/lab-game-spec/1"
-GAME_CATALOG_SCHEMA_VERSION = "worldeval/lab-game-catalog/1"
+GAME_SPEC_SCHEMA_VERSION = "worldeval/lab-game-spec/2"
+GAME_CATALOG_SCHEMA_VERSION = "worldeval/lab-game-catalog/2"
 
 GameReadiness = Literal["live_ready", "demo_replay_ready", "experimental"]
 ControlType = Literal["fixed", "model", "number", "provider", "roster", "select"]
+GameCategoryId = Literal[
+    "sandbox-primitives",
+    "solo-agent-tasks",
+    "two-agent-games",
+    "multi-agent-games",
+    "strategy-worlds",
+]
+GameInteractionKind = Literal["solo", "cooperative", "competitive", "mixed"]
 
 _READINESS_VALUES = frozenset(("live_ready", "demo_replay_ready", "experimental"))
 _CONTROL_TYPES = frozenset(("fixed", "model", "number", "provider", "roster", "select"))
+_CATEGORY_IDS = frozenset(
+    (
+        "sandbox-primitives",
+        "solo-agent-tasks",
+        "two-agent-games",
+        "multi-agent-games",
+        "strategy-worlds",
+    )
+)
+_INTERACTION_KINDS = frozenset(("solo", "cooperative", "competitive", "mixed"))
 
 
 class GameCatalogError(ValueError):
@@ -57,6 +75,147 @@ def _unique_ids(values: tuple[object, ...], *, field_name: str) -> None:
         identifiers.append(identifier)
     if len(set(identifiers)) != len(identifiers):
         raise GameCatalogError(f"{field_name} contains duplicate ids")
+
+
+@dataclass(frozen=True)
+class GameCategory:
+    """One stable, presentation-ordered catalogue category.
+
+    Category identity is deliberately independent from source layout.  Deployment code may move
+    an authority without changing the public game passport or grouped-picker contract.
+    """
+
+    id: GameCategoryId
+    label: str
+    order: int
+    description: str
+
+    def __post_init__(self) -> None:
+        _identifier(self.id, field_name="game category id")
+        if self.id not in _CATEGORY_IDS:
+            raise GameCatalogError("game category is unsupported")
+        _text(self.label, field_name="game category label", maximum_bytes=96)
+        if (
+            isinstance(self.order, bool)
+            or not isinstance(self.order, int)
+            or not 0 <= self.order <= 999
+        ):
+            raise GameCatalogError("game category order is invalid")
+        _text(self.description, field_name="game category description", maximum_bytes=320)
+
+    def public_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "order": self.order,
+            "description": self.description,
+        }
+
+
+GAME_CATEGORIES = (
+    GameCategory(
+        id="sandbox-primitives",
+        label="Sandbox Primitives",
+        order=10,
+        description=(
+            "Godot-owned building blocks used to compose and verify movement, visibility, "
+            "resources, interaction, scoring, and termination."
+        ),
+    ),
+    GameCategory(
+        id="solo-agent-tasks",
+        label="Solo Agent Tasks",
+        order=20,
+        description="Single-agent environments focused on control, planning, and execution.",
+    ),
+    GameCategory(
+        id="two-agent-games",
+        label="Two-Agent Games",
+        order=30,
+        description="Paired competitive or cooperative environments with isolated agent state.",
+    ),
+    GameCategory(
+        id="multi-agent-games",
+        label="Multi-Agent Games",
+        order=40,
+        description="Environments with three or more independently controlled participants.",
+    ),
+    GameCategory(
+        id="strategy-worlds",
+        label="Strategy Worlds",
+        order=50,
+        description=(
+            "Long-horizon worlds centred on economy, tactics, territorial control, and adaptation."
+        ),
+    ),
+)
+
+if (
+    len({category.id for category in GAME_CATEGORIES}) != len(GAME_CATEGORIES)
+    or len({category.order for category in GAME_CATEGORIES}) != len(GAME_CATEGORIES)
+    or tuple(sorted(GAME_CATEGORIES, key=lambda category: category.order)) != GAME_CATEGORIES
+):
+    raise GameCatalogError("game category registry is not unique and presentation-ordered")
+
+_GAME_CATEGORY_BY_ID: Mapping[str, GameCategory] = MappingProxyType(
+    {category.id: category for category in GAME_CATEGORIES}
+)
+
+
+@dataclass(frozen=True)
+class GameParticipantRange:
+    """Participant cardinality supported by one game authority."""
+
+    minimum: int
+    maximum: int
+
+    def __post_init__(self) -> None:
+        for field_name, value in (("minimum", self.minimum), ("maximum", self.maximum)):
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 64:
+                raise GameCatalogError(f"participant {field_name} is invalid")
+        if self.minimum > self.maximum:
+            raise GameCatalogError("participant range is invalid")
+
+    def public_dict(self) -> dict[str, int]:
+        return {"minimum": self.minimum, "maximum": self.maximum}
+
+
+@dataclass(frozen=True)
+class GameCapabilities:
+    """Explicit product support; ``True`` never grants or invents gameplay authority."""
+
+    live_launch: bool
+    demo: bool
+    replay: bool
+    spectator: bool
+    benchmark: bool
+    checkpoint: bool
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, bool)
+            for value in (
+                self.live_launch,
+                self.demo,
+                self.replay,
+                self.spectator,
+                self.benchmark,
+                self.checkpoint,
+            )
+        ):
+            raise GameCatalogError("game capabilities must be explicit booleans")
+        if self.benchmark and not self.replay:
+            raise GameCatalogError("benchmark-capable games require replay evidence")
+
+    def public_dict(self) -> dict[str, bool]:
+        return {
+            "live_launch": self.live_launch,
+            "demo": self.demo,
+            "replay": self.replay,
+            "spectator": self.spectator,
+            "benchmark": self.benchmark,
+            "checkpoint": self.checkpoint,
+        }
 
 
 @dataclass(frozen=True)
@@ -191,6 +350,11 @@ class GameSpec:
     title: str
     readiness: GameReadiness
     readiness_note: str
+    primary_category: GameCategory
+    secondary_tags: tuple[str, ...]
+    participants: GameParticipantRange
+    interaction_kind: GameInteractionKind
+    capabilities: GameCapabilities
     task_ids: tuple[str, ...]
     capability_statements: tuple[str, ...]
     agent_interface: GameAgentInterface
@@ -209,6 +373,36 @@ class GameSpec:
         if self.readiness not in _READINESS_VALUES:
             raise GameCatalogError("game readiness is unsupported")
         _text(self.readiness_note, field_name="game readiness note", maximum_bytes=360)
+        registered_category = _GAME_CATEGORY_BY_ID.get(self.primary_category.id)
+        if registered_category is None or registered_category != self.primary_category:
+            raise GameCatalogError("game primary category is not the registered category")
+        if (
+            not self.secondary_tags
+            or tuple(sorted(self.secondary_tags)) != self.secondary_tags
+            or len(set(self.secondary_tags)) != len(self.secondary_tags)
+        ):
+            raise GameCatalogError("game secondary tags must be non-empty, unique, and sorted")
+        for tag in self.secondary_tags:
+            _identifier(tag, field_name="game secondary tag")
+        if self.interaction_kind not in _INTERACTION_KINDS:
+            raise GameCatalogError("game interaction kind is unsupported")
+        if self.interaction_kind == "solo" and self.participants != GameParticipantRange(1, 1):
+            raise GameCatalogError("solo interaction requires exactly one participant")
+        if self.interaction_kind != "solo" and self.participants.maximum < 2:
+            raise GameCatalogError(
+                "multi-participant interaction requires at least two participants"
+            )
+        if self.readiness == "live_ready" and not self.capabilities.live_launch:
+            raise GameCatalogError("live-ready games must support live launch")
+        if self.readiness == "demo_replay_ready" and (
+            self.capabilities.live_launch
+            or not (self.capabilities.demo or self.capabilities.replay)
+        ):
+            raise GameCatalogError(
+                "demo/replay-ready games must be non-live and support demo or replay"
+            )
+        if self.readiness == "experimental" and self.capabilities.live_launch:
+            raise GameCatalogError("experimental games cannot advertise live launch")
         if not self.task_ids or len(set(self.task_ids)) != len(self.task_ids):
             raise GameCatalogError("game task ids are invalid")
         for task_id in self.task_ids:
@@ -235,6 +429,11 @@ class GameSpec:
             "title": self.title,
             "readiness": self.readiness,
             "readiness_note": self.readiness_note,
+            "primary_category": self.primary_category.public_dict(),
+            "secondary_tags": list(self.secondary_tags),
+            "participants": self.participants.public_dict(),
+            "interaction_kind": self.interaction_kind,
+            "capabilities": self.capabilities.public_dict(),
             "task_ids": list(self.task_ids),
             "capability_statements": list(self.capability_statements),
             "agent_interface": self.agent_interface.public_dict(),
@@ -275,6 +474,9 @@ class GameCatalog:
             raise GameCatalogError("game catalog entries must be non-empty and id-sorted")
         if len({game.id for game in self.games}) != len(self.games):
             raise GameCatalogError("game catalog contains duplicate game ids")
+        for game in self.games:
+            if game.primary_category.id not in _GAME_CATEGORY_BY_ID:
+                raise GameCatalogError("game catalog contains an unknown category")
         object.__setattr__(
             self,
             "_by_id",
@@ -290,8 +492,28 @@ class GameCatalog:
     def _hash_body(self) -> dict[str, object]:
         return {
             "schema_version": self.schema_version,
+            "categories": self.category_groups(),
             "games": [game.public_dict() for game in self.games],
         }
+
+    def category_groups(self) -> list[dict[str, object]]:
+        """Project the complete ordered taxonomy with stable game identities.
+
+        Empty groups remain present so clients can explain the product taxonomy without inventing
+        placeholder games.  A grouped picker may hide an empty group or render it as coming soon.
+        """
+
+        game_ids_by_category = {
+            category.id: [game.id for game in self.games if game.primary_category.id == category.id]
+            for category in GAME_CATEGORIES
+        }
+        return [
+            {
+                **category.public_dict(),
+                "game_ids": game_ids_by_category[category.id],
+            }
+            for category in GAME_CATEGORIES
+        ]
 
     @property
     def catalog_sha256(self) -> str:
@@ -328,9 +550,140 @@ def _mode(id: str, label: str, description: str) -> GameMode:
     return GameMode(id=id, label=label, description=description)
 
 
+def _category(category_id: GameCategoryId) -> GameCategory:
+    return _GAME_CATEGORY_BY_ID[category_id]
+
+
+def _participants(minimum: int, maximum: int) -> GameParticipantRange:
+    return GameParticipantRange(minimum=minimum, maximum=maximum)
+
+
+def _capabilities(
+    *,
+    live_launch: bool,
+    demo: bool,
+    replay: bool,
+    spectator: bool,
+    benchmark: bool = False,
+    checkpoint: bool = False,
+) -> GameCapabilities:
+    return GameCapabilities(
+        live_launch=live_launch,
+        demo=demo,
+        replay=replay,
+        spectator=spectator,
+        benchmark=benchmark,
+        checkpoint=checkpoint,
+    )
+
+
 # Keep this tuple sorted by public ``id``.  The claims below are bound to the current live APIs,
 # deterministic/demo catalogues, and sealed showcases; this is not an aspirational feature list.
 _GAME_SPECS = (
+    GameSpec(
+        id="central-relay",
+        title="Central Relay Duel",
+        readiness="live_ready",
+        readiness_note=(
+            "The frozen v1 paired-series authority supports both session-key live entrants and "
+            "the credential-free Alpha/Bravo Demo pair."
+        ),
+        primary_category=_category("two-agent-games"),
+        secondary_tags=("duel", "objective-control", "seat-swapped"),
+        participants=_participants(2, 2),
+        interaction_kind="competitive",
+        capabilities=_capabilities(
+            live_launch=True,
+            demo=True,
+            replay=True,
+            spectator=True,
+        ),
+        task_ids=("central-relay-v0",),
+        capability_statements=(
+            "Simultaneous two-agent control around a shared relay objective.",
+            "Opponent-aware pressure, guarding, and movement from participant-visible evidence.",
+            "Fairness through two deterministic legs with the entrants assigned to opposite seats.",
+        ),
+        agent_interface=GameAgentInterface(
+            observation=(
+                "Each duelist receives its own participant-visible relay and rival semantics, "
+                "including qualitative bearing, distance, state, and available affordances."
+            ),
+            actions=(
+                "Each entrant supplies an ordinary controller action for the shared fixed-tick "
+                "decision window; Godot applies both accepted actions under one joint clock."
+            ),
+            memory=(
+                "Entrant scratchpads are private and episode-local. They reset between the two "
+                "seat-swapped legs and never become authority state."
+            ),
+        ),
+        scoring=GameScoring(
+            summary=(
+                "Godot determines each leg's terminal outcome and winner. The paired result reports "
+                "wins, draws, verification, and the winner only after both seat assignments finish."
+            ),
+            metrics=(
+                _metric("leg_outcomes", "Leg outcomes", "Terminal outcome and reason per leg."),
+                _metric(
+                    "series_result",
+                    "Series result",
+                    "Entrant wins, draws, and overall paired-series status.",
+                ),
+                _metric(
+                    "seat_symmetry",
+                    "Seat symmetry",
+                    "Like-for-like comparison across the two swapped seat assignments.",
+                ),
+            ),
+        ),
+        configuration_controls=(
+            _control(
+                "entrants",
+                "Entrant controllers",
+                "roster",
+                "Choose two supported live provider/models or the locked Alpha/Bravo Demo pair.",
+            ),
+            _control("seed", "Seed", "number", "Select the deterministic paired-series seed."),
+            _control(
+                "max_live_provider_calls",
+                "Live-call safety limit",
+                "number",
+                "Set the bounded provider-call allowance for the complete two-leg series.",
+            ),
+        ),
+        failure_modes=(
+            "Missing, stale, malformed, or timed-out input becomes neutral input for only the affected participant.",
+            "A leg can finish normally, draw, time out, or seal as void without manufacturing a winner.",
+        ),
+        safety=GameSafety(
+            public_view=(
+                "The spectator feed, sealed replay, hashes, terminal outcomes, and paired result are "
+                "safe authority projections and do not grant control."
+            ),
+            private_agent_state=(
+                "Participant observations and frames, prompts, scratchpads, raw provider output, "
+                "and credentials remain outside public artifacts."
+            ),
+        ),
+        supported_modes=(
+            _mode(
+                "live_two_leg_series",
+                "Live two-leg series",
+                "Provider-backed v1 authority run with deterministic seat swapping.",
+            ),
+            _mode(
+                "deterministic_demo_series",
+                "Deterministic Demo series",
+                "Credential-free Alpha and Bravo policies through the normal provider boundary.",
+            ),
+            _mode(
+                "sealed_replay",
+                "Sealed replay",
+                "Offline-verifiable authority replay and paired result.",
+            ),
+        ),
+    ),
     GameSpec(
         id="checkpoint-race",
         title="Checkpoint Race",
@@ -338,6 +691,16 @@ _GAME_SPECS = (
         readiness_note=(
             "A deterministic, two-leg Demo game with seat swaps; external live-provider entrants "
             "are not enabled for this additive duo task."
+        ),
+        primary_category=_category("two-agent-games"),
+        secondary_tags=("navigation", "race", "seat-swapped"),
+        participants=_participants(2, 2),
+        interaction_kind="competitive",
+        capabilities=_capabilities(
+            live_launch=False,
+            demo=True,
+            replay=True,
+            spectator=True,
         ),
         task_ids=("duo-checkpoint-race-v0",),
         capability_statements=(
@@ -427,6 +790,16 @@ _GAME_SPECS = (
             "The current product surface is a sealed three-faction showcase with cached video and "
             "evaluation; it does not expose a live run composer."
         ),
+        primary_category=_category("strategy-worlds"),
+        secondary_tags=("partial-observation", "resource-management", "strategy"),
+        participants=_participants(3, 3),
+        interaction_kind="competitive",
+        capabilities=_capabilities(
+            live_launch=False,
+            demo=True,
+            replay=True,
+            spectator=True,
+        ),
         task_ids=("crossroads-conquest-v0",),
         capability_statements=(
             "Multi-agent strategy, opponent modelling, negotiation, and trust.",
@@ -499,12 +872,222 @@ _GAME_SPECS = (
         ),
     ),
     GameSpec(
+        id="duo-spar",
+        title="Duo Sparring",
+        readiness="demo_replay_ready",
+        readiness_note=(
+            "The managed v2 authority has a deterministic pressure-versus-counter-guard Demo pair; "
+            "external live-provider entrants are not enabled for this additive duo task."
+        ),
+        primary_category=_category("two-agent-games"),
+        secondary_tags=("combat", "duel", "seat-swapped"),
+        participants=_participants(2, 2),
+        interaction_kind="competitive",
+        capabilities=_capabilities(
+            live_launch=False,
+            demo=True,
+            replay=True,
+            spectator=True,
+        ),
+        task_ids=("duo-spar-v0",),
+        capability_statements=(
+            "Close-range positioning, facing, pressure, and counter-guard timing.",
+            "Visible-opponent action selection without health, transforms, or rival-private state.",
+            "Symmetric combat comparison across two deterministic seat assignments.",
+        ),
+        agent_interface=GameAgentInterface(
+            observation=(
+                "Each participant receives only its visible rival's qualitative bearing, distance, "
+                "combat state, and affordances plus its own participant-safe status."
+            ),
+            actions=(
+                "The locked Demo policies move, turn, strike, or guard for one fixed ten-tick joint "
+                "window; Godot resolves both controls and combat simultaneously."
+            ),
+            memory=(
+                "Each participant has private episode-local controller memory that is cleared before "
+                "the seat-swapped second leg."
+            ),
+        ),
+        scoring=GameScoring(
+            summary=(
+                "Win by authority knockout or resolve the time-limit result. Evaluation reports "
+                "hits, knockouts, reliability, and cross-seat symmetry without exposing health."
+            ),
+            metrics=(
+                _metric("completion", "Completion", "Terminal tick, outcome, and reason."),
+                _metric(
+                    "combat",
+                    "Combat",
+                    "Authority-recorded hits landed, hits received, and knockouts.",
+                ),
+                _metric(
+                    "reliability",
+                    "Reliability",
+                    "Accepted decision windows versus safe fallback windows.",
+                ),
+                _metric("symmetry", "Symmetry", "Hit delta across the two participants."),
+            ),
+        ),
+        configuration_controls=(
+            _control(
+                "demo_pair",
+                "Demo entrants",
+                "fixed",
+                "The checked-in pressure and counter-guard visible-only policies are required.",
+            ),
+            _control("seed", "Seed", "number", "Select the deterministic paired-series seed."),
+        ),
+        failure_modes=(
+            "Missing, stale, malformed, or timed-out input becomes neutral input for the affected participant only.",
+            "The game can end by knockout, time limit, simultaneous terminal state, or a void result.",
+        ),
+        safety=GameSafety(
+            public_view=(
+                "Safe evaluation exposes terminal evidence and aggregate combat totals without "
+                "participant transforms, observations, or health values."
+            ),
+            private_agent_state=(
+                "Private frames, observations, scratchpads, raw policy output, and any provider "
+                "credentials are excluded from public replay and evaluation."
+            ),
+        ),
+        supported_modes=(
+            _mode(
+                "deterministic_demo_series",
+                "Deterministic Demo series",
+                "Two locked visible-only policies in seat-swapped authority legs.",
+            ),
+            _mode(
+                "safe_evaluation",
+                "Safe evaluation",
+                "Allow-listed combat, completion, reliability, and symmetry projection.",
+            ),
+        ),
+    ),
+    GameSpec(
+        id="interaction",
+        title="Interaction",
+        readiness="live_ready",
+        readiness_note=(
+            "The managed solo v1 authority accepts a session-key live model or the locked "
+            "credential-free Interaction Demo policy."
+        ),
+        primary_category=_category("solo-agent-tasks"),
+        secondary_tags=("interaction", "resource-management", "solo-control"),
+        participants=_participants(1, 1),
+        interaction_kind="solo",
+        capabilities=_capabilities(
+            live_launch=True,
+            demo=True,
+            replay=True,
+            spectator=True,
+        ),
+        task_ids=("interaction-v0",),
+        capability_statements=(
+            "Grounded resource gathering and delivery from visible entity affordances.",
+            "Alignment, interaction timing, inventory use, and recovery from interrupted progress.",
+            "Short-horizon action sequencing without coordinates or hidden world state.",
+        ),
+        agent_interface=GameAgentInterface(
+            observation=(
+                "The agent sees visible resource and relay entities with qualitative bearing, "
+                "distance, state, affordances, its inventory, recent events, and prior receipt."
+            ),
+            actions=(
+                "The agent emits one strict controller action per decision window using movement, "
+                "look, interact, cancel, and ordinary controller state."
+            ),
+            memory=(
+                "A bounded private memory update may carry episode-local notes between calls; it "
+                "is not authority state and is absent from public evidence."
+            ),
+        ),
+        scoring=GameScoring(
+            summary=(
+                "Gather one marked material and deposit it at the home relay. Evaluation reports "
+                "success, completion, valid control, collisions, and typed progress evidence."
+            ),
+            metrics=(
+                _metric("completion", "Completion", "Authority success and completion tick."),
+                _metric(
+                    "progress",
+                    "Progress",
+                    "Typed resource-gathered and material-deposited checkpoints.",
+                ),
+                _metric(
+                    "control_quality",
+                    "Control quality",
+                    "Valid actions, interaction alignment failures, and unnecessary collisions.",
+                ),
+            ),
+        ),
+        configuration_controls=(
+            _control(
+                "provider_model",
+                "Provider and model",
+                "model",
+                "Choose a supported live provider/model or the locked Interaction Demo policy.",
+            ),
+            _control("seed", "Seed", "number", "Select the deterministic authority seed."),
+            _control(
+                "maximum_episode_ticks",
+                "Episode tick budget",
+                "number",
+                "Set the bounded solo authority horizon accepted by the episode API.",
+            ),
+        ),
+        failure_modes=(
+            "Invalid, missing, stale, or timed-out provider input becomes a recorded neutral window.",
+            "Misaligned interaction or early cancellation preserves authority state and may require recovery.",
+            "The episode fails at the authority time limit if the deposit is incomplete.",
+        ),
+        safety=GameSafety(
+            public_view=(
+                "Public replay and evaluation contain typed authority progress, safe receipts, "
+                "terminal evidence, and integrity hashes."
+            ),
+            private_agent_state=(
+                "Exact transforms, participant observations and frames, private memory, prompts, "
+                "raw provider output, and credentials remain protected."
+            ),
+        ),
+        supported_modes=(
+            _mode(
+                "live_solo_episode",
+                "Live solo episode",
+                "Provider-backed managed v1 authority episode.",
+            ),
+            _mode(
+                "deterministic_demo",
+                "Deterministic Demo",
+                "Locked credential-free visible-only interaction policy.",
+            ),
+            _mode(
+                "safe_evaluation",
+                "Safe evaluation",
+                "Allow-listed completion, progress, and control-quality evidence.",
+            ),
+        ),
+    ),
+    GameSpec(
         id="labyrinth-run",
         title="Labyrinth Run",
         readiness="live_ready",
         readiness_note=(
             "The v1 three-racer maze endpoint accepts a session-only provider credential; the v0 "
             "showcase remains separately cached."
+        ),
+        primary_category=_category("multi-agent-games"),
+        secondary_tags=("memory", "navigation", "partial-observation", "race"),
+        participants=_participants(3, 3),
+        interaction_kind="competitive",
+        capabilities=_capabilities(
+            live_launch=True,
+            demo=True,
+            replay=True,
+            spectator=True,
+            benchmark=True,
         ),
         task_ids=("trio-maze-race-v0", "trio-maze-race-v1"),
         capability_statements=(
@@ -628,6 +1211,16 @@ _GAME_SPECS = (
             "The current Lab starts a fresh two-leg live RTS Skirmish authority run; a separate "
             "cached v0 showcase remains available for immediate playback."
         ),
+        primary_category=_category("strategy-worlds"),
+        secondary_tags=("combat", "partial-observation", "resource-management", "strategy"),
+        participants=_participants(2, 2),
+        interaction_kind="competitive",
+        capabilities=_capabilities(
+            live_launch=True,
+            demo=True,
+            replay=True,
+            spectator=True,
+        ),
         task_ids=("rts-skirmish-v0", "rts-skirmish-v1"),
         capability_statements=(
             "Long-horizon planning, resource allocation, and task sequencing.",
@@ -728,6 +1321,16 @@ _GAME_SPECS = (
             "A managed solo provider path and a locked participant-visible Demo policy are both "
             "implemented for this control-game task."
         ),
+        primary_category=_category("solo-agent-tasks"),
+        secondary_tags=("navigation", "solo-control"),
+        participants=_participants(1, 1),
+        interaction_kind="solo",
+        capabilities=_capabilities(
+            live_launch=True,
+            demo=True,
+            replay=True,
+            spectator=True,
+        ),
         task_ids=("movement-maze-v0",),
         capability_statements=(
             "Short-horizon navigation from qualitative relative bearings and contact feedback.",
@@ -821,12 +1424,351 @@ _GAME_SPECS = (
         ),
     ),
     GameSpec(
+        id="neutral-encounter",
+        title="Neutral Encounter",
+        readiness="live_ready",
+        readiness_note=(
+            "The managed solo v1 authority accepts a session-key live model or the locked "
+            "credential-free Neutral Encounter Demo policy."
+        ),
+        primary_category=_category("solo-agent-tasks"),
+        secondary_tags=("combat", "interaction", "solo-control"),
+        participants=_participants(1, 1),
+        interaction_kind="solo",
+        capabilities=_capabilities(
+            live_launch=True,
+            demo=True,
+            replay=True,
+            spectator=True,
+        ),
+        task_ids=("neutral-encounter-v0",),
+        capability_statements=(
+            "Combat positioning, guard and dash timing, and energy-aware primary attacks.",
+            "Transition from resolving a visible neutral threat to activating a defended relay.",
+            "Recovery from damage and action cooldowns using only participant-visible state.",
+        ),
+        agent_interface=GameAgentInterface(
+            observation=(
+                "The agent sees a visible neutral and relay through qualitative bearing, distance, "
+                "state, and affordances plus health, energy, cooldown status, recent events, and receipt."
+            ),
+            actions=(
+                "The agent emits strict movement, look, primary, guard, dash, interact, or cancel "
+                "controller input for each bounded decision window."
+            ),
+            memory=(
+                "The runner may retain a bounded private episode scratchpad; Godot does not retain "
+                "it in authority checkpoints and it is excluded from public artifacts."
+            ),
+        ),
+        scoring=GameScoring(
+            summary=(
+                "Defeat or safely resolve the deterministic neutral and activate the relay before "
+                "knockout or time limit. Evaluation exposes safe terminal and control evidence."
+            ),
+            metrics=(
+                _metric(
+                    "completion",
+                    "Completion",
+                    "Relay activation, knockout, or time-limit terminal evidence.",
+                ),
+                _metric(
+                    "combat_control",
+                    "Combat control",
+                    "Damage taken and authority-recorded control changes.",
+                ),
+                _metric(
+                    "progress",
+                    "Progress",
+                    "Typed neutral-damaged and relay-activated authority checkpoints.",
+                ),
+            ),
+        ),
+        configuration_controls=(
+            _control(
+                "provider_model",
+                "Provider and model",
+                "model",
+                "Choose a supported live provider/model or the locked Neutral Encounter Demo policy.",
+            ),
+            _control("seed", "Seed", "number", "Select the deterministic authority seed."),
+            _control(
+                "maximum_episode_ticks",
+                "Episode tick budget",
+                "number",
+                "Set the bounded solo authority horizon accepted by the episode API.",
+            ),
+        ),
+        failure_modes=(
+            "Invalid, missing, stale, or timed-out provider input becomes a recorded neutral window.",
+            "Poor guard, dash, or attack timing can lead to authority-recorded knockout.",
+            "The episode fails at the authority time limit if the relay is not activated.",
+        ),
+        safety=GameSafety(
+            public_view=(
+                "Public evaluation exposes safe terminal, progress, damage, and integrity evidence "
+                "without exact positions or private observations."
+            ),
+            private_agent_state=(
+                "Participant frames and observations, exact transforms, private memory, prompts, "
+                "raw provider output, and credentials remain protected."
+            ),
+        ),
+        supported_modes=(
+            _mode(
+                "live_solo_episode",
+                "Live solo episode",
+                "Provider-backed managed v1 authority episode.",
+            ),
+            _mode(
+                "deterministic_demo",
+                "Deterministic Demo",
+                "Locked credential-free visible-only encounter policy.",
+            ),
+            _mode(
+                "safe_evaluation",
+                "Safe evaluation",
+                "Allow-listed completion, combat-control, and progress evidence.",
+            ),
+        ),
+    ),
+    GameSpec(
+        id="operator-action-course",
+        title="Operator Action Course",
+        readiness="live_ready",
+        readiness_note=(
+            "This is the canonical composite Sandbox Primitives playground: its managed v2 "
+            "Godot authority supports a session-key live model and a locked visible-only Demo."
+        ),
+        primary_category=_category("sandbox-primitives"),
+        secondary_tags=("composite-primitives", "control-validation", "sandbox"),
+        participants=_participants(1, 1),
+        interaction_kind="solo",
+        capabilities=_capabilities(
+            live_launch=True,
+            demo=True,
+            replay=True,
+            spectator=True,
+        ),
+        task_ids=("operator-action-course-v0",),
+        capability_statements=(
+            "One authority-owned course composes movement, turning, gathering, carrying, depositing, and building.",
+            "It also validates dash, guard, primary, cancel, hazard response, and celebration controls.",
+            "The station matrix diagnoses concrete control primitives without creating a second gameplay authority.",
+        ),
+        agent_interface=GameAgentInterface(
+            observation=(
+                "The agent receives only participant-visible station targets, relative semantics, "
+                "affordances, local status, recent events, and the previous authority receipt."
+            ),
+            actions=(
+                "The agent explicitly chooses ordinary controller inputs while Godot advances and "
+                "validates the twelve ordered stations: walk, turn, gather, carry, deposit, build, "
+                "dash, guard, primary, cancel, hazard, and celebrate."
+            ),
+            memory=(
+                "A bounded private episode scratchpad can support station tracking, but it cannot "
+                "alter station state and is never persisted in public evidence."
+            ),
+        ),
+        scoring=GameScoring(
+            summary=(
+                "Complete all twelve ordered stations before the time limit. The strict safe evaluator "
+                "reports the station pass matrix, control accuracy, invalid windows, damage, and distance."
+            ),
+            metrics=(
+                _metric(
+                    "station_matrix",
+                    "Station matrix",
+                    "Pass/fail evidence for each of the twelve authority-owned control stations.",
+                ),
+                _metric(
+                    "control_accuracy",
+                    "Control accuracy",
+                    "Successful command attempts relative to all recorded attempts.",
+                ),
+                _metric(
+                    "safety",
+                    "Safety",
+                    "Invalid windows and authority-recorded damage taken.",
+                ),
+                _metric(
+                    "distance",
+                    "Travelled distance",
+                    "Authority-measured course travel in map units.",
+                ),
+            ),
+        ),
+        configuration_controls=(
+            _control(
+                "provider_model",
+                "Provider and model",
+                "model",
+                "Choose a supported live provider/model or the locked Operator Action Course Demo.",
+            ),
+            _control("seed", "Seed", "number", "Select the deterministic authority seed."),
+            _control(
+                "maximum_episode_ticks",
+                "Episode tick budget",
+                "number",
+                "Set the bounded solo course horizon accepted by the episode API.",
+            ),
+        ),
+        failure_modes=(
+            "Missing, stale, malformed, or timed-out output advances as neutral input and cannot imply continuation.",
+            "A command attempted at the wrong station or with invalid state is recorded without granting progress.",
+            "The course fails at the authority time limit if any required station remains incomplete.",
+        ),
+        safety=GameSafety(
+            public_view=(
+                "The public course view and evaluation expose the ordered station matrix and safe "
+                "numeric authority aggregates; they do not become a competing simulator."
+            ),
+            private_agent_state=(
+                "Exact transforms, private observations and frames, prompts, raw provider output, "
+                "scratchpad content, and credentials remain protected."
+            ),
+        ),
+        supported_modes=(
+            _mode(
+                "live_solo_course",
+                "Live solo course",
+                "Provider-backed managed v2 composite primitive run.",
+            ),
+            _mode(
+                "deterministic_demo",
+                "Deterministic Demo",
+                "Locked credential-free visible-only policy over the same Godot authority.",
+            ),
+            _mode(
+                "primitive_diagnostics",
+                "Primitive diagnostics",
+                "Allow-listed station, control, safety, and distance evaluation.",
+            ),
+        ),
+    ),
+    GameSpec(
+        id="orientation",
+        title="Orientation",
+        readiness="live_ready",
+        readiness_note=(
+            "The managed solo v1 authority accepts a session-key live model or the locked "
+            "credential-free Orientation Demo policy."
+        ),
+        primary_category=_category("solo-agent-tasks"),
+        secondary_tags=("navigation", "orientation", "solo-control"),
+        participants=_participants(1, 1),
+        interaction_kind="solo",
+        capabilities=_capabilities(
+            live_launch=True,
+            demo=True,
+            replay=True,
+            spectator=True,
+        ),
+        task_ids=("orientation-v0",),
+        capability_statements=(
+            "Egocentric turning and movement from qualitative relative bearing and distance.",
+            "Stable target approach and sustained beacon hold without coordinates.",
+            "Correction after overshoot, collision, or leaving the goal radius early.",
+        ),
+        agent_interface=GameAgentInterface(
+            observation=(
+                "The agent sees the goal beacon through qualitative bearing, distance, state, and "
+                "affordances plus its facing, contact, recent events, and previous receipt."
+            ),
+            actions=(
+                "The agent emits one strict controller action per decision window using movement, "
+                "look, and ordinary button state; Godot applies and receipts it."
+            ),
+            memory=(
+                "The runner may carry a bounded private episode memory update between decisions; "
+                "it is not included in authority state or public evidence."
+            ),
+        ),
+        scoring=GameScoring(
+            summary=(
+                "Reach the visible beacon and remain inside its radius for the required hold. "
+                "Evaluation reports success, completion, held ticks, control validity, and collisions."
+            ),
+            metrics=(
+                _metric("completion", "Completion", "Beacon-held success and completion tick."),
+                _metric(
+                    "beacon_hold",
+                    "Beacon hold",
+                    "Authority-recorded total held ticks and typed beacon checkpoints.",
+                ),
+                _metric(
+                    "control_quality",
+                    "Control quality",
+                    "Valid-action rate, controller changes, and unnecessary collisions.",
+                ),
+            ),
+        ),
+        configuration_controls=(
+            _control(
+                "provider_model",
+                "Provider and model",
+                "model",
+                "Choose a supported live provider/model or the locked Orientation Demo policy.",
+            ),
+            _control("seed", "Seed", "number", "Select the deterministic authority seed."),
+            _control(
+                "maximum_episode_ticks",
+                "Episode tick budget",
+                "number",
+                "Set the bounded solo authority horizon accepted by the episode API.",
+            ),
+        ),
+        failure_modes=(
+            "Invalid, missing, stale, or timed-out provider input becomes a recorded neutral window.",
+            "Leaving the beacon before the hold completes resets authority hold progress.",
+            "The episode fails at the authority time limit if the beacon hold is incomplete.",
+        ),
+        safety=GameSafety(
+            public_view=(
+                "Public replay and evaluation expose typed beacon events, safe receipts, terminal "
+                "evidence, and integrity hashes without exact transforms."
+            ),
+            private_agent_state=(
+                "Participant frames and observations, private memory, prompts, raw provider output, "
+                "and credentials remain protected."
+            ),
+        ),
+        supported_modes=(
+            _mode(
+                "live_solo_episode",
+                "Live solo episode",
+                "Provider-backed managed v1 authority episode.",
+            ),
+            _mode(
+                "deterministic_demo",
+                "Deterministic Demo",
+                "Locked credential-free visible-only orientation policy.",
+            ),
+            _mode(
+                "safe_evaluation",
+                "Safe evaluation",
+                "Allow-listed completion, beacon-hold, and control-quality evidence.",
+            ),
+        ),
+    ),
+    GameSpec(
         id="relay-control",
         title="Relay Control",
         readiness="demo_replay_ready",
         readiness_note=(
             "A deterministic two-leg Demo game with visible-only policies; external live-provider "
             "entrants are not enabled for this additive duo task."
+        ),
+        primary_category=_category("two-agent-games"),
+        secondary_tags=("duel", "objective-control", "seat-swapped"),
+        participants=_participants(2, 2),
+        interaction_kind="competitive",
+        capabilities=_capabilities(
+            live_launch=False,
+            demo=True,
+            replay=True,
+            spectator=True,
         ),
         task_ids=("duo-relay-control-v0",),
         capability_statements=(
@@ -897,6 +1839,16 @@ _GAME_SPECS = (
         readiness_note=(
             "A richer deterministic two-leg Demo game; external live-provider entrants are not enabled "
             "for this additive duo task."
+        ),
+        primary_category=_category("two-agent-games"),
+        secondary_tags=("combat", "economy", "resource-management", "seat-swapped"),
+        participants=_participants(2, 2),
+        interaction_kind="competitive",
+        capabilities=_capabilities(
+            live_launch=False,
+            demo=True,
+            replay=True,
+            spectator=True,
         ),
         task_ids=("duo-resource-relay-v0",),
         capability_statements=(
@@ -976,6 +1928,16 @@ _GAME_SPECS = (
         readiness_note=(
             "The managed solo authority accepts either a live provider or the dedicated no-key construction "
             "Demo path; the multi-action showcase reuses the same construction authority task."
+        ),
+        primary_category=_category("solo-agent-tasks"),
+        secondary_tags=("construction", "long-horizon", "resource-management"),
+        participants=_participants(1, 1),
+        interaction_kind="solo",
+        capabilities=_capabilities(
+            live_launch=True,
+            demo=True,
+            replay=True,
+            spectator=True,
         ),
         task_ids=("construction-v0",),
         capability_statements=(
@@ -1068,6 +2030,230 @@ _GAME_SPECS = (
             ),
         ),
     ),
+    GameSpec(
+        id="trio-free-for-all",
+        title="Trio Free-for-All",
+        readiness="demo_replay_ready",
+        readiness_note=(
+            "The v3 three-participant authority currently runs the fixed credential-free "
+            "Sol/Luna/Terra roster across a cyclic three-leg Demo series."
+        ),
+        primary_category=_category("multi-agent-games"),
+        secondary_tags=("combat", "free-for-all", "seat-rotated"),
+        participants=_participants(3, 3),
+        interaction_kind="competitive",
+        capabilities=_capabilities(
+            live_launch=False,
+            demo=True,
+            replay=True,
+            spectator=True,
+        ),
+        task_ids=("trio-free-for-all-v0",),
+        capability_statements=(
+            "Three-way combat positioning, threat selection, guard, dash, and attack timing.",
+            "Adaptation as rivals are damaged or eliminated under simultaneous joint windows.",
+            "Cyclic fairness: every Demo entrant uses every seat and spawn exactly once.",
+        ),
+        agent_interface=GameAgentInterface(
+            observation=(
+                "Each participant receives only its own visible rivals, objective semantics, "
+                "qualitative geometry, status, recent events, and prior receipt."
+            ),
+            actions=(
+                "Each active participant chooses movement, turn, primary, guard, dash, interact, "
+                "or neutral control for a shared fixed ten-tick window; Godot commits all actions."
+            ),
+            memory=(
+                "The three Demo controllers have independent private episode memory. Eliminated "
+                "participants become permanently call-free neutral seats for the rest of that leg."
+            ),
+        ),
+        scoring=GameScoring(
+            summary=(
+                "Resolve each leg by last standing, simultaneous knockout, or time-limit ranking. "
+                "The series aggregates placements, damage, objective points, reliability, and seat symmetry."
+            ),
+            metrics=(
+                _metric(
+                    "placements", "Placements", "Competition rankings and explicit ties per leg."
+                ),
+                _metric(
+                    "combat",
+                    "Combat",
+                    "Authority-recorded damage dealt, damage taken, and elimination state.",
+                ),
+                _metric(
+                    "reliability",
+                    "Reliability",
+                    "Decision windows, fallback windows, provider calls, and suppressed post-elimination calls.",
+                ),
+                _metric(
+                    "cyclic_symmetry",
+                    "Cyclic symmetry",
+                    "Aggregate range after every entrant uses every seat and spawn.",
+                ),
+            ),
+        ),
+        configuration_controls=(
+            _control(
+                "demo_roster",
+                "Demo roster",
+                "fixed",
+                "The checked-in Sol, Luna, and Terra visible-only policies are required.",
+            ),
+            _control("seed", "Seed", "number", "Select the deterministic three-leg series seed."),
+            _control(
+                "cyclic_schedule",
+                "Cyclic schedule",
+                "fixed",
+                "Three legs rotate every entrant through every participant seat and spawn.",
+            ),
+        ),
+        failure_modes=(
+            "Missing, stale, malformed, or timed-out input becomes neutral input for only the affected participant.",
+            "Eliminated participants cannot act and do not consume further provider calls in that leg.",
+            "A leg can resolve last-standing, simultaneous knockout, time-limit ranking or tie, or void.",
+        ),
+        safety=GameSafety(
+            public_view=(
+                "The spectator projection, replay, placements, safe aggregates, and verification "
+                "hashes are browser-safe authority evidence."
+            ),
+            private_agent_state=(
+                "Participant observations and frames, transforms, private memory, raw policy output, "
+                "and credentials remain excluded from public artifacts."
+            ),
+        ),
+        supported_modes=(
+            _mode(
+                "deterministic_demo_series",
+                "Deterministic Demo series",
+                "Three cyclic legs with the locked Sol/Luna/Terra roster.",
+            ),
+            _mode(
+                "safe_evaluation",
+                "Safe evaluation",
+                "Placements, combat, reliability, and cyclic-normalization aggregates.",
+            ),
+            _mode(
+                "sealed_replay",
+                "Sealed replay",
+                "Offline-verifiable per-leg authority evidence.",
+            ),
+        ),
+    ),
+    GameSpec(
+        id="trio-relay",
+        title="Trio Relay",
+        readiness="demo_replay_ready",
+        readiness_note=(
+            "The v3 three-participant authority currently runs the fixed credential-free "
+            "Sol/Luna/Terra roster across a cyclic three-leg Demo series."
+        ),
+        primary_category=_category("multi-agent-games"),
+        secondary_tags=("objective-control", "race", "seat-rotated"),
+        participants=_participants(3, 3),
+        interaction_kind="competitive",
+        capabilities=_capabilities(
+            live_launch=False,
+            demo=True,
+            replay=True,
+            spectator=True,
+        ),
+        task_ids=("trio-relay-v0",),
+        capability_statements=(
+            "Three-way movement, contested objective control, and pressure-versus-defence timing.",
+            "Simultaneous decisions around a relay whose hold progress resets when contested.",
+            "Cyclic fairness: every Demo entrant uses every seat and spawn exactly once.",
+        ),
+        agent_interface=GameAgentInterface(
+            observation=(
+                "Each participant receives only its visible rivals and central relay through "
+                "qualitative bearing, distance, state, and affordances plus local status and receipts."
+            ),
+            actions=(
+                "Each entrant chooses movement, turn, interact, or neutral controller input for the "
+                "same fixed ten-tick window; combat controls are disabled by this authority."
+            ),
+            memory=(
+                "Sol, Luna, and Terra keep isolated private episode memory that resets for each "
+                "new cyclic seat assignment."
+            ),
+        ),
+        scoring=GameScoring(
+            summary=(
+                "Secure the relay for the required uninterrupted hold or resolve a time-limit ranking. "
+                "The series reports placements, objective points, reliability, and cyclic symmetry."
+            ),
+            metrics=(
+                _metric(
+                    "placements", "Placements", "Competition rankings and explicit ties per leg."
+                ),
+                _metric(
+                    "objective_points",
+                    "Objective points",
+                    "Authority-recorded relay-control contribution by entrant.",
+                ),
+                _metric(
+                    "reliability",
+                    "Reliability",
+                    "Decision windows, fallback windows, and provider calls.",
+                ),
+                _metric(
+                    "cyclic_symmetry",
+                    "Cyclic symmetry",
+                    "Aggregate range after every entrant uses every seat and spawn.",
+                ),
+            ),
+        ),
+        configuration_controls=(
+            _control(
+                "demo_roster",
+                "Demo roster",
+                "fixed",
+                "The checked-in Sol, Luna, and Terra visible-only policies are required.",
+            ),
+            _control("seed", "Seed", "number", "Select the deterministic three-leg series seed."),
+            _control(
+                "cyclic_schedule",
+                "Cyclic schedule",
+                "fixed",
+                "Three legs rotate every entrant through every participant seat and spawn.",
+            ),
+        ),
+        failure_modes=(
+            "Missing, stale, malformed, or timed-out input becomes neutral input for only the affected participant.",
+            "Contested or empty relay occupancy clears the current uninterrupted hold.",
+            "A leg can resolve relay hold, time-limit ranking or tie, or void.",
+        ),
+        safety=GameSafety(
+            public_view=(
+                "The spectator projection, replay, placements, safe aggregates, and verification "
+                "hashes are browser-safe authority evidence."
+            ),
+            private_agent_state=(
+                "Participant observations and frames, transforms, private memory, raw policy output, "
+                "and credentials remain excluded from public artifacts."
+            ),
+        ),
+        supported_modes=(
+            _mode(
+                "deterministic_demo_series",
+                "Deterministic Demo series",
+                "Three cyclic legs with the locked Sol/Luna/Terra roster.",
+            ),
+            _mode(
+                "safe_evaluation",
+                "Safe evaluation",
+                "Placements, objective, reliability, and cyclic-normalization aggregates.",
+            ),
+            _mode(
+                "sealed_replay",
+                "Sealed replay",
+                "Offline-verifiable per-leg authority evidence.",
+            ),
+        ),
+    ),
 )
 
 GAME_CATALOG = GameCatalog(games=_GAME_SPECS)
@@ -1082,13 +2268,19 @@ def game_spec(game_id: str) -> GameSpec:
 __all__ = [
     "GAME_CATALOG",
     "GAME_CATALOG_SCHEMA_VERSION",
+    "GAME_CATEGORIES",
     "GAME_SPEC_SCHEMA_VERSION",
     "GameAgentInterface",
+    "GameCapabilities",
     "GameCatalog",
     "GameCatalogError",
+    "GameCategory",
+    "GameCategoryId",
     "GameConfigurationControl",
+    "GameInteractionKind",
     "GameMetric",
     "GameMode",
+    "GameParticipantRange",
     "GameReadiness",
     "GameSafety",
     "GameScoring",

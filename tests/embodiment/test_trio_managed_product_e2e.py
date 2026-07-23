@@ -158,13 +158,15 @@ async def test_api_demo_trio_managed_v3_three_leg_archive_survives_restart(
             ):
                 assert protected not in replay.content
 
-            for _ in range(80):
+            # Sealing three legs includes asynchronous evidence hashing and durable archive
+            # publication. Allow the same one-minute completion budget used by managed runs.
+            for _ in range(1_200):
                 archive_response = await client.get(
                     f"/api/embodiment/trio-series/{series_id}/archive"
                 )
                 assert archive_response.status_code == 200
                 archive = archive_response.json()
-                if archive.get("state") != "saving":
+                if archive["evidence"]["state"] != "saving":
                     break
                 await asyncio.sleep(0.05)
             assert archive["evidence"]["state"] == "ready"

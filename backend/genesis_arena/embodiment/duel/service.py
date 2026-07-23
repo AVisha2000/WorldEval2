@@ -13,8 +13,9 @@ from ..credentials import SessionCredential
 from ..duo_games.catalog import CENTRAL_RELAY_TASK_ID, duo_game
 from ..duo_games.rts_skirmish_v1 import TASK_ID as RTS_SKIRMISH_V1_TASK_ID
 from ..evaluation_projection import build_paired_duel_leg_evaluation_projection
+from ..managed_session import ManagedSessionError
 from ..protocol import canonical_sha256, strict_json_loads
-from .archive import ArchivedDuelSeries, DuelSeriesArchive, DuelSeriesArchiveError
+from .archive import ArchivedDuelSeries, DuelSeriesArchive
 from .contracts import DuelEntrant, PairedDuelResult
 from .evidence import DuelSeriesEvidenceBundle, DuelSeriesExecution
 from .participant_frames import (
@@ -127,7 +128,14 @@ class DuelSeriesService:
         self._archive = archive
         self._participant_frame_reader = participant_frame_reader
         self._records: dict[str, _Record] = {}
-        self._lock = asyncio.Lock()
+        self._lock: asyncio.Lock | None = None
+
+    def _service_lock(self) -> asyncio.Lock:
+        """Bind the coordination lock only from an active async service call."""
+
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def create(
         self,
@@ -208,7 +216,7 @@ class DuelSeriesService:
                 task_id,
             )
             record = _Record(spec, credentials)
-            async with self._lock:
+            async with self._service_lock():
                 self._records[series_id] = record
                 record.task = asyncio.create_task(
                     self._run(record), name=f"duel-series-{series_id}"
@@ -231,6 +239,11 @@ class DuelSeriesService:
                 and execution.evidence.public.series_id != record.spec.series_id
             ):
                 raise ValueError("duel series evidence belongs to a different series")
+            # The executor owns provider use only through the authority result. Evidence
+            # projection and native archival can take minutes and must never extend credential
+            # retention beyond gameplay.
+            for credential in record.credentials.values():
+                credential.close()
             record.result = execution.result
             if execution.evidence is not None:
                 record.public_evidence = execution.evidence.public
@@ -242,9 +255,9 @@ class DuelSeriesService:
                 record.state = "completed"
                 if self._archive is not None:
                     record.archive_state = "saving"
-                    evaluation = self._evaluation_projection(record)
-                    timeline = self._timeline_projection(record)
                     try:
+                        evaluation = self._evaluation_projection(record)
+                        timeline = self._timeline_projection(record)
                         record.archive = await asyncio.to_thread(
                             self._archive.save,
                             record.public_evidence,
@@ -253,20 +266,38 @@ class DuelSeriesService:
                             protected_bundle=record.protected_evidence,
                         )
                         record.archive_state = "ready"
-                    except (OSError, DuelSeriesArchiveError):
+                    except Exception:
                         # A durable-export failure does not rewrite an already verified authority
-                        # result.  The public lifecycle reports the bounded unavailable state.
+                        # result. Projection and exporter details can contain protected material,
+                        # so the public lifecycle reports only the bounded unavailable state.
                         record.archive_state = "unavailable"
                 else:
                     record.archive_state = "unavailable"
             else:
                 record.state = "completed"
         except asyncio.CancelledError:
-            record.state = "cancelled"
+            if record.state == "completed":
+                # Shutdown may cancel a task that is only persisting non-authoritative media.
+                # Never rewrite the already sealed gameplay result.
+                if record.archive_state == "saving":
+                    record.archive_state = "unavailable"
+            else:
+                record.state = "cancelled"
         except Exception as error:
             # Keep only the exception class for local diagnostics. Messages can contain provider
             # or transport material and must never enter status, logs, evidence, or archives.
-            record.failure_type = type(error).__name__
+            if isinstance(error, ManagedSessionError):
+                cause = error.__cause__
+                cause_code = getattr(cause, "code", None)
+                record.failure_type = (
+                    f"{error.code}:{cause_code}"
+                    if isinstance(cause_code, str)
+                    else f"{error.code}:{type(cause).__name__}"
+                    if cause is not None
+                    else error.code
+                )
+            else:
+                record.failure_type = type(error).__name__
             record.failure = "duel_series_execution_failed"
             record.state = "failed"
         finally:
@@ -492,19 +523,29 @@ class DuelSeriesService:
 
     async def cancel(self, series_id: str) -> Mapping[str, object]:
         record = await self._record(series_id)
-        if record.task is not None and not record.task.done():
+        if (
+            record.state in {"queued", "running"}
+            and record.task is not None
+            and not record.task.done()
+        ):
             record.cancel_event.set()
             record.task.cancel()
             await asyncio.gather(record.task, return_exceptions=True)
         return self._status(record)
 
     async def aclose(self) -> None:
-        async with self._lock:
+        async with self._service_lock():
             records = tuple(self._records.values())
         for record in records:
-            if record.task is not None and not record.task.done():
+            if (
+                record.state in {"queued", "running"}
+                and record.task is not None
+                and not record.task.done()
+            ):
                 record.cancel_event.set()
-                record.task.cancel()
+        # Executors are required to honor the cancellation event at their bounded decision
+        # boundary. Awaiting instead of cancelling prevents asyncio.to_thread archive work from
+        # continuing after the live service has reported it unavailable.
         await asyncio.gather(
             *(record.task for record in records if record.task is not None),
             return_exceptions=True,
@@ -516,14 +557,14 @@ class DuelSeriesService:
             record.live_broadcast_preview.close()
 
     async def _record(self, series_id: str) -> _Record:
-        async with self._lock:
+        async with self._service_lock():
             record = self._records.get(series_id)
         if record is None:
             raise DuelSeriesNotFoundError(series_id)
         return record
 
     async def _optional_record(self, series_id: str) -> _Record | None:
-        async with self._lock:
+        async with self._service_lock():
             return self._records.get(series_id)
 
     async def _archived(self, series_id: str) -> ArchivedDuelSeries | None:

@@ -183,7 +183,9 @@ async def test_resource_relay_two_leg_demo_managed_hybrid_evaluation_and_archive
             task_id=TASK_ID,
         )
         series_id = str(created["series_id"])
-        for _ in range(300):
+        # Two rendered 1,200-tick legs can exceed one minute on a modest or thermally
+        # constrained development machine even though the authority is still progressing.
+        for _ in range(600):
             status = await service.status(series_id)
             if status["state"] in ("completed", "failed"):
                 break
@@ -230,7 +232,13 @@ async def test_resource_relay_two_leg_demo_managed_hybrid_evaluation_and_archive
         assert public.layer == "public"
         assert b"authority_replay" not in public.bundle_bytes
         assert b"observation_json_base64" not in public.bundle_bytes
-        archive = await service.archive_status(series_id)
+        # Evidence persistence is deliberately asynchronous and the two-leg resource replay is
+        # large enough that canonical validation can take more than the short-game allowance.
+        for _ in range(1_200):
+            archive = await service.archive_status(series_id)
+            if archive["evidence"]["state"] != "saving":
+                break
+            await asyncio.sleep(0.05)
         assert archive["evidence"]["state"] == "ready"
 
         for participant_id in ("participant_0", "participant_1"):

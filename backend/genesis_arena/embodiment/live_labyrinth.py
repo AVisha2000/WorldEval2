@@ -1432,6 +1432,78 @@ def public_live_evaluation(replay: Mapping[str, Any]) -> Mapping[str, Any]:
     }
 
 
+def _interactive_benchmark_metrics(
+    execution: LiveMazeRaceExecution,
+) -> tuple[Mapping[str, object], ...]:
+    """Derive the recipe metrics from authority-owned safe evidence only."""
+
+    verify_live_replay(execution.replay)
+    racers = {
+        value["participant_id"]: value
+        for value in execution.replay["racers"]
+        if isinstance(value, Mapping)
+    }
+    decisions = {
+        participant_id: [
+            item for item in execution.safe_decisions if item.participant_id == participant_id
+        ]
+        for participant_id in PARTICIPANTS
+    }
+    participant_budget = int(execution.replay["participant_call_budget"])
+    result: list[Mapping[str, object]] = []
+    for participant_id in PARTICIPANTS:
+        racer = racers[participant_id]
+        trace = decisions[participant_id]
+        calls = len(trace)
+        if calls != racer["provider_calls"]:
+            raise LiveLabyrinthError("live labyrinth benchmark call accounting differs")
+        completed = racer["finished"] is True
+        recovery_opportunities = sum(
+            item.disposition in {"invalid", "provider_failure"} for item in trace[:-1]
+        )
+        successful_recoveries = sum(
+            previous.disposition in {"invalid", "provider_failure"}
+            and current.disposition == "accepted"
+            and current.cells_moved > 0
+            for previous, current in zip(trace, trace[1:])
+        )
+        invalid_decisions = int(racer["invalid_decisions"])
+        result.append(
+            {
+                "entrant_id": racer["entrant_id"],
+                "metrics": {
+                    "budget_charged_calls": calls if completed else participant_budget,
+                    "completion_basis_points": 10_000 if completed else 0,
+                    "input_tokens": sum(
+                        item.telemetry.input_tokens or 0
+                        for item in trace
+                        if item.telemetry is not None
+                    ),
+                    "invalid_action_rate_basis_points": (
+                        0 if calls == 0 else invalid_decisions * 10_000 // calls
+                    ),
+                    "latency_ms": sum(
+                        item.telemetry.latency_ms for item in trace if item.telemetry is not None
+                    ),
+                    "output_tokens": sum(
+                        item.telemetry.output_tokens or 0
+                        for item in trace
+                        if item.telemetry is not None
+                    ),
+                    "path_efficiency_basis_points": (
+                        int(racer["path_efficiency_basis_points"]) if completed else 0
+                    ),
+                    "recovery_rate_basis_points": (
+                        0
+                        if recovery_opportunities == 0
+                        else successful_recoveries * 10_000 // recovery_opportunities
+                    ),
+                },
+            }
+        )
+    return tuple(result)
+
+
 def verify_live_replay(replay: Mapping[str, Any]) -> None:
     """Verify public spatial state and reject any protected material in replay evidence."""
     if (
@@ -1929,8 +2001,13 @@ class LiveLabyrinthService:
         self, *, render_video: Callable[[Mapping[str, Any]], object] | None = None
     ) -> None:
         self._records: dict[str, _ServiceRecord] = {}
-        self._lock = asyncio.Lock()
+        self._lock: asyncio.Lock | None = None
         self._render_video = render_video
+
+    def _service_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def create(
         self,
@@ -1973,7 +2050,7 @@ class LiveLabyrinthService:
             skill_mode=skill_mode,
         )
         self._store_observer_frame(record, _initial_observer_frame(record, status="queued"))
-        async with self._lock:
+        async with self._service_lock():
             self._records[episode_id] = record
             record.task = asyncio.create_task(
                 self._run(
@@ -2008,6 +2085,9 @@ class LiveLabyrinthService:
     ) -> None:
         record.state = "running"
         self._store_observer_frame(record, _initial_observer_frame(record, status="running"))
+        terminal_state = "failed"
+        terminal_failure: str | None = None
+        should_render = False
         try:
             record.execution = await run_live_labyrinth_race(
                 episode_id=episode_id,
@@ -2030,30 +2110,36 @@ class LiveLabyrinthService:
             if provider_failures and len(provider_failures) == len(
                 record.execution.protected_decisions
             ):
-                record.state = "failed"
-                record.failure = _live_provider_failure_code(provider_failures)
+                terminal_state = "failed"
+                terminal_failure = _live_provider_failure_code(provider_failures)
                 return
             self._capture_terminal_observer_frame(record)
-            record.state = "completed"
-            if self._render_video is not None:
-                record.video_state = "saving"
-                asyncio.create_task(
-                    self._render(record, episode_id), name=f"live-maze-video-{episode_id}"
-                )
+            terminal_state = "completed"
+            should_render = self._render_video is not None
         except asyncio.CancelledError:
-            record.state = "cancelled"
+            terminal_state = "cancelled"
         except Exception:
-            record.state = "failed"
-            record.failure = "live_labyrinth_execution_failed"
+            terminal_state = "failed"
+            terminal_failure = "live_labyrinth_execution_failed"
         finally:
             if cleanup is not None:
                 try:
                     await cleanup()
                 except Exception:
-                    if record.state == "completed":
-                        record.state = "failed"
-                    if record.failure is None:
-                        record.failure = "live_labyrinth_cleanup_failed"
+                    if terminal_state == "completed":
+                        terminal_state = "failed"
+                    if terminal_failure is None:
+                        terminal_failure = "live_labyrinth_cleanup_failed"
+            # Cleanup is part of the authority boundary: do not publish a terminal success that
+            # can later regress when provider credentials fail to close.  LabRunService can now
+            # observe either a nonterminal run or its single irrevocable terminal state.
+            record.state = terminal_state
+            record.failure = terminal_failure
+            if terminal_state == "completed" and should_render:
+                record.video_state = "saving"
+                asyncio.create_task(
+                    self._render(record, episode_id), name=f"live-maze-video-{episode_id}"
+                )
 
     async def _render(self, record: _ServiceRecord, episode_id: str) -> None:
         if self._render_video is None or record.execution is None:
@@ -2074,19 +2160,27 @@ class LiveLabyrinthService:
 
     async def result(self, episode_id: str) -> Mapping[str, Any]:
         record = await self._record(episode_id)
-        if record.execution is None:
+        if record.state != "completed" or record.execution is None:
             raise LiveLabyrinthNotReadyError("live_labyrinth_result_not_ready")
         return record.execution.replay["result"]
 
     async def evaluation(self, episode_id: str) -> Mapping[str, Any]:
         record = await self._record(episode_id)
-        if record.execution is None:
+        if record.state != "completed" or record.execution is None:
             raise LiveLabyrinthNotReadyError("live_labyrinth_evaluation_not_ready")
         return record.execution.evaluation
 
+    async def benchmark_metrics(self, episode_id: str) -> tuple[Mapping[str, object], ...]:
+        """Return safe numeric metrics derived from the sealed authority execution."""
+
+        record = await self._record(episode_id)
+        if record.state != "completed" or record.execution is None:
+            raise LiveLabyrinthNotReadyError("live_labyrinth_metrics_not_ready")
+        return _interactive_benchmark_metrics(record.execution)
+
     async def replay(self, episode_id: str) -> Mapping[str, Any]:
         record = await self._record(episode_id)
-        if record.execution is None:
+        if record.state != "completed" or record.execution is None:
             raise LiveLabyrinthNotReadyError("live_labyrinth_replay_not_ready")
         return record.execution.replay
 
@@ -2271,7 +2365,7 @@ class LiveLabyrinthService:
             return
 
     async def _record(self, episode_id: str) -> _ServiceRecord:
-        async with self._lock:
+        async with self._service_lock():
             try:
                 return self._records[episode_id]
             except KeyError as error:

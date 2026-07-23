@@ -375,8 +375,11 @@ class ManagedWorldArenaSession:
     def _validate_observations(self, value: object) -> None:
         if not isinstance(value, Mapping) or set(value) != set(self._config.participant_ids):
             raise ManagedSessionError("embodiment_session_observations_invalid")
-        for observation in value.values():
-            self._package.validate("observation", observation)
+        try:
+            for observation in value.values():
+                self._package.validate("observation", observation)
+        except ProtocolValidationError as error:
+            raise ManagedSessionError("embodiment_session_observations_invalid") from error
 
     def _require_started(self) -> None:
         if not self._started:

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react"
 import type { CachedMazeShowcaseView } from "@/api"
 import { getCachedMazeShowcase } from "@/api"
 import {
+  cancelLabRun,
   cloneLabRun,
   connectLocalLabSession,
   getLabAuthMode,
@@ -10,14 +11,21 @@ import {
   getLabRunProjection,
   getLabRunSpectator,
   getLabRuns,
+  getLabSandboxManifest,
   getLabSession,
   getLabyrinthBenchmark,
   getPublicGameBenchmark,
+  getPublicGameReplays,
   getPublicLabGames,
   getPublicLabGame,
   launchLabRunDraft,
+  launchGenericGame,
   launchLabyrinth,
+  publishLabRun,
   requestLabMagicLink,
+  sealLabRun,
+  submitLabRunToBenchmark,
+  verifyLabRun,
 } from "./lab-api"
 import {
   BenchmarksPanel,
@@ -34,13 +42,19 @@ import type {
   LabBenchmark,
   LabAuthMode,
   LabGame,
+  LabGenericLaunchInput,
   LabLaunchInput,
   LabProjection,
+  LabPublicReplay,
   LabRun,
+  LabRunEvidenceAction,
+  LabRunEvidenceResult,
+  LabSandboxManifest,
   LabSession,
   LabSpectatorFeed,
   RemoteState,
 } from "./types"
+import { isOpenAiLabRunMode } from "./types"
 import "./lab.css"
 
 const loading = <T,>(): RemoteState<T> => ({ kind: "loading", data: null })
@@ -50,6 +64,7 @@ const ready = <T,>(data: T): RemoteState<T> => ({ kind: "ready", data })
 type ActiveLabRun = {
   run: LabRun
   projection: LabProjection
+  pollRevision: number
 }
 
 function mergeSpectatorFeed(
@@ -64,7 +79,9 @@ function mergeSpectatorFeed(
   for (const frame of incoming.frames) frames.set(frame.sequence, frame)
   return {
     ...incoming,
-    frames: [...frames.values()].sort((first, second) => first.sequence - second.sequence).slice(-128),
+    frames: [...frames.values()]
+      .sort((first, second) => first.sequence - second.sequence)
+      .slice(-128),
   }
 }
 
@@ -79,6 +96,8 @@ export function LabApp() {
   const [session, setSession] =
     useState<RemoteState<LabSession | null>>(loading)
   const [authMode, setAuthMode] = useState<RemoteState<LabAuthMode>>(loading)
+  const [sandbox, setSandbox] =
+    useState<RemoteState<LabSandboxManifest>>(loading)
   const [activeRunId, setActiveRunId] = useState<string | null>(null)
   const [activeRun, setActiveRun] = useState<RemoteState<ActiveLabRun | null>>(
     ready(null)
@@ -111,6 +130,7 @@ export function LabApp() {
       showcaseResult,
       sessionResult,
       authModeResult,
+      sandboxResult,
     ] = await Promise.allSettled([
       getLabGames().catch(() => getPublicLabGames()),
       getLabRuns(),
@@ -120,6 +140,7 @@ export function LabApp() {
       getCachedMazeShowcase(),
       getLabSession(),
       getLabAuthMode(),
+      getLabSandboxManifest(),
     ])
     setGames(
       gameResult.status === "fulfilled" ? ready(gameResult.value) : offline()
@@ -147,6 +168,11 @@ export function LabApp() {
         ? ready(authModeResult.value)
         : offline()
     )
+    setSandbox(
+      sandboxResult.status === "fulfilled"
+        ? ready(sandboxResult.value)
+        : offline()
+    )
   }, [])
 
   useEffect(() => {
@@ -163,6 +189,7 @@ export function LabApp() {
     let cancelled = false
     let timer: number | undefined
     let completedVideoChecks = 0
+    let consecutiveFailures = 0
 
     const poll = async () => {
       try {
@@ -171,7 +198,29 @@ export function LabApp() {
           getLabRunProjection(activeRunId),
         ])
         if (cancelled) return
-        setActiveRun(ready({ run, projection }))
+        if (
+          run.id !== activeRunId ||
+          projection.runId !== activeRunId ||
+          !run.contractSha256 ||
+          projection.contractSha256 !== run.contractSha256 ||
+          (projection.summary && projection.summary.gameId !== run.gameId) ||
+          (run.gameId === "labyrinth-run"
+            ? !projection.frame || projection.summary !== null
+            : projection.frame !== null || !projection.summary)
+        ) {
+          throw new Error("Run authority evidence differs from its contract")
+        }
+        consecutiveFailures = 0
+        setActiveRun((current) =>
+          ready({
+            run,
+            projection,
+            pollRevision:
+              current.kind === "ready" && current.data
+                ? current.data.pollRevision + 1
+                : 1,
+          })
+        )
         setRuns((current) => {
           if (current.kind !== "ready") return current
           const found = current.data.some((item) => item.id === run.id)
@@ -182,9 +231,10 @@ export function LabApp() {
           )
         })
         const inFlight =
-          (run.lifecycle === "queued" || run.lifecycle === "running") &&
+          ["queued", "running", "checkpointed"].includes(run.lifecycle) &&
           run.authorityAvailable !== false
         const waitingForVideo =
+          run.gameId === "labyrinth-run" &&
           run.lifecycle === "completed" &&
           !run.videoAvailable &&
           completedVideoChecks++ < 120
@@ -192,7 +242,20 @@ export function LabApp() {
           timer = window.setTimeout(() => void poll(), 800)
         }
       } catch {
-        if (!cancelled) setActiveRun(offline())
+        if (!cancelled) {
+          consecutiveFailures += 1
+          setActiveRun((current) =>
+            current.kind === "ready" && current.data
+              ? current
+              : consecutiveFailures >= 3
+                ? offline()
+                : current
+          )
+          timer = window.setTimeout(
+            () => void poll(),
+            Math.min(5_000, 500 * 2 ** Math.min(consecutiveFailures, 4))
+          )
+        }
       }
     }
     void poll()
@@ -203,7 +266,12 @@ export function LabApp() {
   }, [activeRunId])
 
   useEffect(() => {
-    if (!activeRunId || activeAuthorityUnavailable) return
+    if (
+      !activeRunId ||
+      activeRunId.startsWith("run_game_") ||
+      activeAuthorityUnavailable
+    )
+      return
     let cancelled = false
     let timer: number | undefined
     let cursor = 0
@@ -218,7 +286,12 @@ export function LabApp() {
         cursor = feed.cursor
         terminalEmptyPolls = feed.frames.length ? 0 : terminalEmptyPolls + 1
         setSpectator((current) =>
-          ready(mergeSpectatorFeed(current.kind === "ready" ? current.data : null, feed))
+          ready(
+            mergeSpectatorFeed(
+              current.kind === "ready" ? current.data : null,
+              feed
+            )
+          )
         )
       } catch {
         if (!cancelled) setSpectator(offline())
@@ -254,15 +327,35 @@ export function LabApp() {
     return runId
   }
 
-  async function startDraftLabyrinth(
+  async function startGenericGame(
+    input: LabGenericLaunchInput
+  ): Promise<string | null> {
+    if (session.kind !== "ready" || !session.data)
+      throw new Error("No local Lab session")
+    const launched = await launchGenericGame(input, session.data.csrfToken)
+    setDraftLaunch(null)
+    setSelectedGameId(launched.gameId)
+    setActiveRun(loading())
+    setSpectator(ready(null))
+    setActiveRunId(launched.id)
+    setView("lab")
+    await refresh()
+    return launched.id
+  }
+
+  async function startDraftRun(
     draft: LabRun,
     apiKey: string
   ): Promise<string | null> {
+    const demo = draft.mode === "demo"
     if (
       session.kind !== "ready" ||
       !session.data ||
       draft.lifecycle !== "draft" ||
-      draft.provider !== "openai" ||
+      !(
+        (demo && draft.provider === null) ||
+        (isOpenAiLabRunMode(draft.mode) && draft.provider === "openai")
+      ) ||
       !draft.contractSha256 ||
       !draft.parentContractSha256
     ) {
@@ -274,21 +367,25 @@ export function LabApp() {
     const current = await getLabRun(draft.id)
     if (
       current.lifecycle !== "draft" ||
-      current.provider !== "openai" ||
+      current.gameId !== draft.gameId ||
+      current.gameVersion !== draft.gameVersion ||
+      current.mode !== draft.mode ||
+      current.provider !== draft.provider ||
       current.contractSha256 !== draft.contractSha256 ||
-      !current.parentContractSha256
+      current.parentContractSha256 !== draft.parentContractSha256
     ) {
       throw new Error("Frozen clone is no longer launchable")
     }
 
     const launched = await launchLabRunDraft(
-      draft.id,
+      current,
       apiKey,
       session.data.csrfToken
     )
     setDraftLaunch(null)
     setActiveRun(loading())
     setSpectator(loading())
+    setSelectedGameId(launched.gameId)
     setActiveRunId(launched.id)
     setView("lab")
     setRuns((existing) => {
@@ -320,18 +417,171 @@ export function LabApp() {
     setActiveRun(ready(null))
     setSpectator(ready(null))
     setDraftLaunch(run)
+    setSelectedGameId(run.gameId)
     setView("lab")
   }
 
   async function cloneRun(source: LabRun): Promise<void> {
     if (session.kind !== "ready" || !session.data)
       throw new Error("No local Lab session")
-    const draft = await cloneLabRun(source.id, session.data.csrfToken)
+    const draft = await cloneLabRun(source, session.data.csrfToken)
     setRuns((existing) => {
       if (existing.kind !== "ready") return existing
-      return ready([draft, ...existing.data.filter((run) => run.id !== draft.id)])
+      return ready([
+        draft,
+        ...existing.data.filter((run) => run.id !== draft.id),
+      ])
     })
     openDraft(draft)
+  }
+
+  async function actOnRunEvidence(
+    source: LabRun,
+    action: LabRunEvidenceAction
+  ): Promise<LabRunEvidenceResult> {
+    if (session.kind !== "ready" || !session.data) {
+      throw new Error("No local Lab session")
+    }
+    if (!source.contractSha256) {
+      throw new Error("Run contract evidence is unavailable")
+    }
+    let result: LabRunEvidenceResult
+    if (action === "publish") {
+      result = await publishLabRun(
+        source.id,
+        source.gameId,
+        source.contractSha256,
+        session.data.csrfToken
+      )
+    } else if (action === "benchmark") {
+      result = await submitLabRunToBenchmark(
+        source.id,
+        source.contractSha256,
+        session.data.csrfToken
+      )
+      try {
+        setBenchmark(ready(await getLabyrinthBenchmark()))
+      } catch {
+        setBenchmark(offline())
+      }
+    } else {
+      const updated =
+        action === "seal"
+          ? await sealLabRun(
+              source.id,
+              source.gameId,
+              source.contractSha256,
+              session.data.csrfToken
+            )
+          : await verifyLabRun(
+              source.id,
+              source.gameId,
+              source.contractSha256,
+              session.data.csrfToken
+            )
+      result = {
+        run: updated,
+        notice:
+          action === "seal"
+            ? "Run cartridge sealed."
+            : "Durable run evidence verified.",
+        publicPath: null,
+      }
+      setRuns((existing) =>
+        existing.kind === "ready"
+          ? ready(
+              existing.data.map((run) =>
+                run.id === updated.id ? updated : run
+              )
+            )
+          : existing
+      )
+      if (activeRunId === updated.id) {
+        setActiveRun((current) =>
+          current.kind === "ready" &&
+          current.data &&
+          current.data.run.id === updated.id
+            ? ready({
+                ...current.data,
+                run: updated,
+                pollRevision: current.data.pollRevision + 1,
+              })
+            : current
+        )
+        try {
+          const projection = await getLabRunProjection(updated.id)
+          setActiveRun((current) =>
+            current.kind === "ready" &&
+            current.data &&
+            current.data.run.id === updated.id
+              ? ready({
+                  run: updated,
+                  projection,
+                  pollRevision: current.data.pollRevision + 1,
+                })
+              : current
+          )
+        } catch {
+          // The lifecycle mutation already succeeded. Keep the last safe
+          // projection and let normal polling recover independently.
+        }
+      }
+    }
+    return result
+  }
+
+  async function cancelRun(source: LabRun): Promise<void> {
+    if (session.kind !== "ready" || !session.data) {
+      throw new Error("No local Lab session")
+    }
+    if (!source.contractSha256) {
+      throw new Error("Run contract evidence is unavailable")
+    }
+    const cancelled = await cancelLabRun(
+      source.id,
+      source.gameId,
+      source.contractSha256,
+      session.data.csrfToken
+    )
+    setRuns((existing) =>
+      existing.kind === "ready"
+        ? ready(
+            existing.data.map((run) =>
+              run.id === cancelled.id ? cancelled : run
+            )
+          )
+        : existing
+    )
+    if (activeRunId === cancelled.id) {
+      setActiveRun((current) =>
+        current.kind === "ready" &&
+        current.data &&
+        current.data.run.id === cancelled.id
+          ? ready({
+              ...current.data,
+              run: cancelled,
+              pollRevision: current.data.pollRevision + 1,
+            })
+          : current
+      )
+      try {
+        const projection = await getLabRunProjection(cancelled.id)
+        setActiveRun((current) =>
+          current.kind === "ready" &&
+          current.data &&
+          current.data.run.id === cancelled.id
+            ? ready({
+                run: cancelled,
+                projection,
+                pollRevision: current.data.pollRevision + 1,
+              })
+            : current
+        )
+      } catch {
+        // Cancellation is authoritative even when the safe projection refresh
+        // is temporarily unavailable.
+      }
+    }
   }
 
   function openRun(run: LabRun) {
@@ -342,6 +592,7 @@ export function LabApp() {
     setActiveRun(loading())
     setSpectator(loading())
     setDraftLaunch(null)
+    setSelectedGameId(run.gameId)
     setActiveRunId(run.id)
     setView("lab")
   }
@@ -373,7 +624,9 @@ export function LabApp() {
           {view === "lab" ? (
             <SimulationStage
               activeRun={activeRun}
+              cancelEnabled={session.kind === "ready" && session.data !== null}
               games={games}
+              onCancel={cancelRun}
               onSelectGame={showGame}
               showcase={showcase.kind === "ready" ? showcase.data : null}
               showcaseState={showcase}
@@ -385,12 +638,19 @@ export function LabApp() {
               game={selectedGame}
               games={games}
               onSelectGame={showGame}
+              sandbox={sandbox}
             />
           ) : null}
           {view === "runs" ? (
             <RunsPanel
               cloneEnabled={session.kind === "ready" && session.data !== null}
+              cancelEnabled={session.kind === "ready" && session.data !== null}
+              evidenceEnabled={
+                session.kind === "ready" && session.data !== null
+              }
               onClone={cloneRun}
+              onCancel={cancelRun}
+              onEvidenceAction={actOnRunEvidence}
               onOpen={openRun}
               runs={runs}
             />
@@ -404,10 +664,23 @@ export function LabApp() {
       <RunComposer
         authMode={authMode}
         draft={draftLaunch}
-        key={draftLaunch?.id ?? "fresh-labyrinth-run"}
+        game={selectedGame}
+        key={
+          draftLaunch?.id ??
+          (selectedGame
+            ? [
+                selectedGame.id,
+                selectedGame.participants.minimum,
+                selectedGame.participants.maximum,
+                selectedGame.capabilities.demo,
+                selectedGame.capabilities.liveLaunch,
+              ].join(":")
+            : "catalogue-loading")
+        }
         onConnect={connectSession}
-        onLaunchDraft={startDraftLabyrinth}
-        onLaunch={startLabyrinth}
+        onLaunchDraft={startDraftRun}
+        onLaunchGeneric={startGenericGame}
+        onLaunchLabyrinth={startLabyrinth}
         onRequestMagicLink={requestMagicLink}
         session={session}
       />
@@ -418,13 +691,16 @@ export function LabApp() {
 export function PublicLabApp({ gameId }: { gameId: string }) {
   const [game, setGame] = useState<RemoteState<LabGame>>(loading)
   const [benchmark, setBenchmark] = useState<RemoteState<LabBenchmark>>(loading)
+  const [replays, setReplays] =
+    useState<RemoteState<LabPublicReplay[]>>(loading)
 
   useEffect(() => {
     let active = true
     void Promise.allSettled([
       getPublicLabGame(gameId),
       getPublicGameBenchmark(gameId),
-    ]).then(([gameResult, benchmarkResult]) => {
+      getPublicGameReplays(gameId),
+    ]).then(([gameResult, benchmarkResult, replayResult]) => {
       if (!active) return
       setGame(
         gameResult.status === "fulfilled" ? ready(gameResult.value) : offline()
@@ -432,6 +708,11 @@ export function PublicLabApp({ gameId }: { gameId: string }) {
       setBenchmark(
         benchmarkResult.status === "fulfilled"
           ? ready(benchmarkResult.value)
+          : offline()
+      )
+      setReplays(
+        replayResult.status === "fulfilled"
+          ? ready(replayResult.value)
           : offline()
       )
     })
@@ -447,7 +728,7 @@ export function PublicLabApp({ gameId }: { gameId: string }) {
         <span>Unlisted game guide</span>
       </header>
       <main>
-        <PublicGamePage benchmark={benchmark} game={game} />
+        <PublicGamePage benchmark={benchmark} game={game} replays={replays} />
       </main>
     </div>
   )

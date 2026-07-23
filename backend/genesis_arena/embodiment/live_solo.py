@@ -423,6 +423,14 @@ class LiveSoloRunner:
                 ProviderFailureKind.INVALID_RESPONSE, result.telemetry
             )
             action = None
+        parsing_disposition = "accepted" if action is not None else "rejected"
+        if evidence_request.action_schema_json != request.action_schema_json:
+            # A task-planning wrapper may turn a separately schema-checked milestone into a
+            # controller action (including a safe local wait for an invalid milestone).  The
+            # protected raw evidence is the planner output, not that generated controller JSON,
+            # so claiming the runner parsed the raw evidence as a controller action would be
+            # misleading.
+            parsing_disposition = "not_attempted"
         return _ActionAttempt(
             action,
             result,
@@ -430,7 +438,7 @@ class LiveSoloRunner:
             evidence_raw_output,
             evidence_request,
             adapter_audits,
-            "accepted" if action is not None else "rejected",
+            parsing_disposition,
             task_continuation,
         )
 

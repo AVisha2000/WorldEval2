@@ -471,21 +471,21 @@ func observe(participant_id: String) -> Dictionary:
 	var entities: Array[Dictionary] = []
 	for resource_id: String in _sorted_keys(resources):
 		var resource: Dictionary = resources[resource_id]
-		if str(resource.team) == participant_id: entities.append({"id": resource_id, "kind": "resource_" + str(resource.kind), "bearing": "front", "distance": "medium", "affordances": ["gather"], "state": str(resource.state)})
+		if str(resource.team) == participant_id: entities.append({"id": _visible_id(resource_id), "kind": "resource_" + str(resource.kind), "bearing": "front", "distance": "medium", "affordances": ["gather"], "state": str(resource.state)})
 	for unit_id: String in _team_unit_ids(participant_id):
 		var unit: Dictionary = units[unit_id]
-		entities.append({"id": unit_id, "kind": "unit", "bearing": "front", "distance": "near", "affordances": ["task"], "state": "alive" if bool(unit.alive) else "defeated"})
+		entities.append({"id": _visible_id(unit_id), "kind": "unit", "bearing": "front", "distance": "near", "affordances": ["task"], "state": "alive" if bool(unit.alive) else "defeated"})
 	if story_phase in ["bridge_battle", "pursuit", "tower_siege", "town_hall_siege", "victory"]:
 		for unit_id: String in _team_unit_ids(_rival(participant_id)):
 			var rival_unit: Dictionary = units[unit_id]
 			if bool(rival_unit.alive):
-				entities.append({"id": unit_id, "kind": "hostile_unit", "bearing": "front", "distance": "near", "affordances": ["attack_unit"], "state": "alive"})
-	entities.append({"id": "town_hall", "kind": "town_hall", "bearing": "front", "distance": "near", "affordances": ["return_material"], "state": str(structures[participant_id].town_hall.state)})
-	entities.append({"id": "barracks", "kind": "barracks", "bearing": "front", "distance": "near", "affordances": ["build", "arm"], "state": str(structures[participant_id].barracks.state)})
-	entities.append({"id": "tower", "kind": "tower", "bearing": "front", "distance": "near", "affordances": ["build"], "state": str(structures[participant_id].tower.state)})
+				entities.append({"id": _visible_id(unit_id), "kind": "hostile_unit", "bearing": "front", "distance": "near", "affordances": ["attack_unit"], "state": "alive"})
+	entities.append({"id": _visible_id("town_hall"), "kind": "town_hall", "bearing": "front", "distance": "near", "affordances": ["return_material"], "state": str(structures[participant_id].town_hall.state)})
+	entities.append({"id": _visible_id("barracks"), "kind": "barracks", "bearing": "front", "distance": "near", "affordances": ["build", "arm"], "state": str(structures[participant_id].barracks.state)})
+	entities.append({"id": _visible_id("tower"), "kind": "tower", "bearing": "front", "distance": "near", "affordances": ["build"], "state": str(structures[participant_id].tower.state)})
 	if story_phase in ["tower_siege", "town_hall_siege", "victory"]:
-		entities.append({"id": "enemy_tower", "kind": "hostile_tower", "bearing": "front", "distance": "medium", "affordances": ["attack_structure"], "state": str(structures[_rival(participant_id)].tower.state)})
-		entities.append({"id": "enemy_town_hall", "kind": "hostile_town_hall", "bearing": "front", "distance": "medium", "affordances": ["attack_structure"], "state": str(structures[_rival(participant_id)].town_hall.state)})
+		entities.append({"id": _visible_id("enemy_tower"), "kind": "hostile_tower", "bearing": "front", "distance": "medium", "affordances": ["attack_structure"], "state": str(structures[_rival(participant_id)].tower.state)})
+		entities.append({"id": _visible_id("enemy_town_hall"), "kind": "hostile_town_hall", "bearing": "front", "distance": "medium", "affordances": ["attack_structure"], "state": str(structures[_rival(participant_id)].town_hall.state)})
 	return {"protocol_version": PROTOCOL_VERSION, "episode_id": episode_id, "observation_seq": observation_seq, "tick": tick, "profile": "text-visible-v1", "goal": "Grow workers into militia and destroy the opposing Town Hall.", "remaining_ticks": maxi(0, MAXIMUM_TICKS - tick), "self": {"health_percent": 100, "energy_percent": 100, "facing": "east", "contact": "clear", "inventory": [], "status": [story_phase]}, "visible_entities": entities, "recent_events": _events_for(participant_id), "previous_receipt": previous_receipts.get(participant_id), "memory": str(operators[participant_id].memory), "terminal": terminal.duplicate(true)}
 
 
@@ -550,7 +550,7 @@ func participant_presentation_source(participant_id: String) -> Dictionary:
 	for resource_id: String in _sorted_keys(resources):
 		var resource: Dictionary = resources[resource_id]
 		if str(resource.team) == participant_id:
-			public_resources.append({"id": resource_id, "kind": "resource_wood" if resource.kind == "tree" else "resource_ore", "position_mt": {"x": resource.position_mt.x, "y": resource.position_mt.y}, "stock": resource.stock, "state": resource.state})
+			public_resources.append({"id": _visible_id(resource_id), "kind": "resource_wood" if resource.kind == "tree" else "resource_ore", "position_mt": {"x": resource.position_mt.x, "y": resource.position_mt.y}, "stock": resource.stock, "state": resource.state})
 	var safe_events: Array[Dictionary] = []
 	for event: Dictionary in _events_for(participant_id):
 		safe_events.append({"type": str(event.kind), "public_summary": str(event.summary)})
@@ -568,6 +568,14 @@ func _sync_operator(participant_id: String) -> void:
 
 func _resource_id(participant_id: String, kind: String, index: int) -> String:
 	return ("blue" if participant_id == "participant_0" else "red") + "_" + kind + "_" + str(index)
+
+
+func _visible_id(authority_id: String) -> String:
+	# The frozen v2 observation contract reserves semantic IDs beginning with `v_`.  Gameplay and
+	# sealed task plans keep their stable authority IDs; only the participant-visible projection
+	# crosses this explicit namespace boundary.
+	return "v_" + authority_id
+
 
 func _unit_id(participant_id: String, index: int) -> String:
 	return ("blue" if participant_id == "participant_0" else "red") + "_" + str(index)

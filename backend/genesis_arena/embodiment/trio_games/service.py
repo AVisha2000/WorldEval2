@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Mapping
 
-from .archive import ArchivedTrioSeries, TrioSeriesArchive, TrioSeriesArchiveError
+from .archive import ArchivedTrioSeries, TrioSeriesArchive
 from .common import TRIO_PARTICIPANT_IDS
 from .evidence import TrioSeriesEvidence, TrioSeriesEvidenceBundle, TrioSeriesExecution
 from .participant_frames import (
@@ -70,6 +70,7 @@ class _Record:
     task: asyncio.Task[None] | None = None
     archive: ArchivedTrioSeries | None = None
     archive_state: str = "pending"
+    archive_failure: str | None = field(default=None, repr=False)
     frames: TrioParticipantFrameStore = field(default_factory=TrioParticipantFrameStore)
     preview: TrioParticipantPreviewChannel = field(
         default_factory=TrioParticipantPreviewChannel
@@ -85,7 +86,12 @@ class TrioSeriesService:
         self._executor = executor
         self._archive = archive
         self._records: dict[str, _Record] = {}
-        self._lock = asyncio.Lock()
+        self._lock: asyncio.Lock | None = None
+
+    def _service_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def create(
         self,
@@ -121,7 +127,7 @@ class TrioSeriesService:
             schedule_nonce=secrets.token_hex(16),
         )
         record = _Record(TrioSeriesSpec(plan, max_provider_calls))
-        async with self._lock:
+        async with self._service_lock():
             self._records[series_id] = record
             record.task = asyncio.create_task(self._run(record), name=f"trio-series-{series_id}")
         return self._status(record)
@@ -153,8 +159,16 @@ class TrioSeriesService:
                         protected=execution.evidence.protected,
                     )
                     record.archive_state = "ready"
-                except (OSError, TrioSeriesArchiveError):
+                except asyncio.CancelledError:
                     record.archive_state = "unavailable"
+                    record.archive_failure = "trio_archive_save_cancelled"
+                    raise
+                except Exception:
+                    # Archival is downstream of an already verified authority result. Never let
+                    # an exporter bug strand the public lifecycle in "saving" or rewrite the
+                    # completed game as an execution failure. Exception messages remain private.
+                    record.archive_state = "unavailable"
+                    record.archive_failure = "trio_archive_save_failed"
         except asyncio.CancelledError:
             record.state = "cancelled"
         except Exception as error:
@@ -362,7 +376,7 @@ class TrioSeriesService:
         return value
 
     async def _optional_record(self, series_id: str) -> _Record | None:
-        async with self._lock:
+        async with self._service_lock():
             return self._records.get(series_id)
 
     async def _archived(self, series_id: str) -> ArchivedTrioSeries | None:

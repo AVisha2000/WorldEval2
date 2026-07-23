@@ -785,6 +785,7 @@ def _deserialize_audit(value: Any) -> tuple[ProviderAuditRecord, str]:
         raise EpisodeArtifactError("serialized provider result fields differ")
     telemetry = result["telemetry"]
     if not isinstance(telemetry, dict) or set(telemetry) != {
+        "cache_write_tokens",
         "cached_input_tokens",
         "input_tokens",
         "latency_ms",

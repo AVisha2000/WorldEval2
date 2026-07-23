@@ -179,6 +179,9 @@ def _assert_sha256(name: str, value: object) -> str:
 def _assert_identifier(name: str, value: object) -> str:
     if not isinstance(value, str) or _IDENTIFIER.fullmatch(value) is None:
         raise LabContractError(f"{name} is invalid")
+    encoded = value.encode("utf-8", errors="strict")
+    if any(pattern.search(encoded) for pattern in _SECRET_PATTERNS):
+        raise LabContractError(f"credential-like material is forbidden in {name}")
     return value
 
 

@@ -14,6 +14,7 @@ DUO_TASKS = (
     "duo-relay-control-v0",
     "duo-spar-v0",
     "duo-resource-relay-v0",
+    "rts-skirmish-v0",
 )
 
 

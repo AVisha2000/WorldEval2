@@ -8,6 +8,7 @@ for the existing live authority, then is excluded from every Lab contract, artif
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
@@ -15,8 +16,36 @@ from fastapi import APIRouter, Body, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 
 from .credentials import SessionCredential
-from .lab.contracts import LabContractError, RunEntrant, RunMode
+from .demo_scenarios import demo_scenario
+from .duo_games.catalog import duo_game
+from .lab.benchmarks import BenchmarkStore, LabBenchmarkError
+from .lab.contracts import LabContractError, RunContract, RunEntrant, RunMode
+from .lab.game_runs import (
+    AttachedGameRun,
+    GenericLabRunError,
+    GenericLabRunNotFoundError,
+    GenericLabRunService,
+)
 from .lab.games import GameCatalogError, game_spec
+from .lab.publications import (
+    PublicReplayNotFoundError,
+    PublicReplayPublicationError,
+    PublicReplayStore,
+    PublicReplayStoreError,
+)
+from .lab.runtime_registry import (
+    GameRuntimeModeUnavailableError,
+    GameRuntimeProfile,
+    GameRuntimeRegistryError,
+    resolve_runtime_launch,
+    runtime_profile,
+    safe_runtime_manifest,
+)
+from .lab.sandbox import (
+    SandboxManifestError,
+    draft_sandbox_recipe,
+    sandbox_manifest,
+)
 from .lab.service import (
     DraftLabyrinthLaunch,
     LabRunError,
@@ -32,12 +61,15 @@ from .live_labyrinth import (
 )
 from .live_runtime import close_provider_adapter, provider_adapter
 from .maze_maps import MazeMapSpec
+from .trio_games.scheduling import TRIO_DEMO_ENTRANTS
 
 router = APIRouter(prefix="/api/lab", tags=["WorldEval Lab"])
 public_router = APIRouter(prefix="/api/public/games", tags=["WorldEval public game guides"])
 _BODY = Body(...)
 _LABYRINTH_PROVIDERS = frozenset(("openai", "anthropic", "gemini"))
 _LABYRINTH_SKILL_MODES = frozenset(("none", "maze-navigation-v1"))
+_GENERIC_SESSION_PROVIDERS = frozenset(("openai", "anthropic", "gemini"))
+_SAFE_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 _CLONE_CHANGE_FIELDS = frozenset(
     (
         "budget",
@@ -69,6 +101,64 @@ def _lab_runs(request: Request) -> LabRunService:
     if not isinstance(service, LabRunService):
         raise RuntimeError("WorldEval Lab run service is not configured")
     return service
+
+
+def _generic_lab_runs(request: Request) -> GenericLabRunService:
+    service = getattr(request.app.state, "lab_game_runs", None)
+    if not isinstance(service, GenericLabRunService):
+        raise RuntimeError("WorldEval generic Lab run service is not configured")
+    return service
+
+
+def _optional_generic_lab_runs(request: Request) -> GenericLabRunService | None:
+    service = getattr(request.app.state, "lab_game_runs", None)
+    if service is None:
+        # Compatibility for narrow test/embedded apps that mount the Labyrinth-only router.
+        return None
+    if not isinstance(service, GenericLabRunService):
+        raise RuntimeError("WorldEval generic Lab run service is invalid")
+    return service
+
+
+def _public_replays(request: Request) -> PublicReplayStore:
+    store = getattr(request.app.state, "lab_public_replays", None)
+    if not isinstance(store, PublicReplayStore):
+        raise RuntimeError("WorldEval public replay store is not configured")
+    return store
+
+
+def _benchmark_store(request: Request) -> BenchmarkStore:
+    store = getattr(request.app.state, "lab_benchmarks", None)
+    if not isinstance(store, BenchmarkStore):
+        raise RuntimeError("WorldEval benchmark store is not configured")
+    return store
+
+
+def _optional_benchmark_store(request: Request) -> BenchmarkStore | None:
+    store = getattr(request.app.state, "lab_benchmarks", None)
+    if store is None:
+        return None
+    if not isinstance(store, BenchmarkStore):
+        raise RuntimeError("WorldEval benchmark store is invalid")
+    return store
+
+
+def _generic_authority_service(request: Request, authority_kind: str) -> Any:
+    state_name = {
+        "solo_episode": "embodiment_episodes",
+        "paired_series": "embodiment_series",
+        "trio_series": "embodiment_trio_series",
+    }.get(authority_kind)
+    if state_name is None:
+        raise RuntimeError("WorldEval game authority is unsupported")
+    service = getattr(request.app.state, state_name, None)
+    if service is None or not callable(getattr(service, "create", None)):
+        raise RuntimeError("WorldEval game authority is not configured")
+    return service
+
+
+def _is_generic_run_id(run_id: str) -> bool:
+    return isinstance(run_id, str) and run_id.startswith("run_game_")
 
 
 def _live_labyrinth(request: Request) -> Any:
@@ -207,6 +297,46 @@ async def list_games(response: Response) -> Mapping[str, object]:
     return labyrinth_game_catalogue()
 
 
+@router.get("/runtime-manifest")
+async def get_runtime_manifest(response: Response) -> Mapping[str, object]:
+    """Publish admitted logical runtime profiles without paths or authority handles."""
+
+    response.headers["Cache-Control"] = "no-store"
+    return safe_runtime_manifest()
+
+
+@router.get("/sandbox")
+async def get_sandbox_manifest(response: Response) -> Mapping[str, object]:
+    response.headers["Cache-Control"] = "no-store"
+    return sandbox_manifest()
+
+
+@router.post("/sandbox/recipes/draft", status_code=201)
+async def create_sandbox_recipe_draft(
+    response: Response, payload: Any = _BODY
+) -> Mapping[str, object]:
+    """Compose safe draft metadata; this never grants executable game authority."""
+
+    if not isinstance(payload, dict) or set(payload) != {
+        "primitive_ids",
+        "recipe_id",
+        "summary",
+        "title",
+    }:
+        raise HTTPException(status_code=422, detail={"code": "invalid_sandbox_recipe"})
+    try:
+        recipe = draft_sandbox_recipe(
+            recipe_id=payload["recipe_id"],
+            title=payload["title"],
+            summary=payload["summary"],
+            primitive_ids=payload["primitive_ids"],
+        )
+    except (SandboxManifestError, TypeError, ValueError):
+        raise HTTPException(status_code=422, detail={"code": "invalid_sandbox_recipe"}) from None
+    response.headers["Cache-Control"] = "no-store"
+    return recipe.public_dict()
+
+
 @router.get("/games/{game_id}")
 async def get_game(game_id: str, response: Response) -> Mapping[str, object]:
     response.headers["Cache-Control"] = "no-store"
@@ -245,32 +375,108 @@ async def get_public_game_benchmark(
 
     response.headers["Cache-Control"] = "public, max-age=300"
     response.headers["X-Robots-Tag"] = "noindex, nofollow"
-    if game_id != "labyrinth-run":
+    try:
+        game_spec(game_id)
+    except GameCatalogError:
+        raise HTTPException(status_code=404, detail={"code": "public_game_not_found"}) from None
+    store = _optional_benchmark_store(request)
+    if store is not None:
         try:
-            game_spec(game_id)
-        except GameCatalogError:
-            raise HTTPException(status_code=404, detail={"code": "public_game_not_found"}) from None
-        return {
-            "game_id": game_id,
-            "season_state": "not_available",
-            "verified_results": [],
-            "message": "No verified benchmark season has been published for this game.",
-        }
-    return _lab_runs(request).benchmark_status()
+            return await asyncio.to_thread(store.game_status, game_id)
+        except LabBenchmarkError:
+            raise HTTPException(
+                status_code=503, detail={"code": "public_benchmark_store_unavailable"}
+            ) from None
+    if game_id == "labyrinth-run":
+        return _lab_runs(request).benchmark_status()
+    return {
+        "game_id": game_id,
+        "season_state": "not_available",
+        "verified_results": [],
+        "message": "No verified benchmark season has been published for this game.",
+    }
+
+
+@public_router.get("/{game_id}/replays")
+async def list_public_game_replays(
+    request: Request, game_id: str, response: Response
+) -> Mapping[str, object]:
+    """List only replays that an operator explicitly published for this game."""
+
+    try:
+        game_spec(game_id)
+        projection = await asyncio.to_thread(
+            _public_replays(request).public_game_projection, game_id
+        )
+    except GameCatalogError:
+        raise HTTPException(status_code=404, detail={"code": "public_game_not_found"}) from None
+    except (PublicReplayPublicationError, PublicReplayStoreError):
+        raise HTTPException(
+            status_code=503, detail={"code": "public_replay_store_unavailable"}
+        ) from None
+    response.headers["Cache-Control"] = "public, max-age=60"
+    response.headers["X-Robots-Tag"] = "noindex, nofollow"
+    return projection
+
+
+@public_router.get("/{game_id}/replays/{publication_slug}")
+async def get_public_game_replay(
+    request: Request,
+    game_id: str,
+    publication_slug: str,
+    response: Response,
+) -> Mapping[str, object]:
+    """Resolve one unlisted safe replay without exposing its private run identity."""
+
+    try:
+        game_spec(game_id)
+        publication = await asyncio.to_thread(_public_replays(request).get, publication_slug)
+    except GameCatalogError:
+        raise HTTPException(status_code=404, detail={"code": "public_game_not_found"}) from None
+    except (PublicReplayNotFoundError, PublicReplayPublicationError):
+        raise HTTPException(status_code=404, detail={"code": "public_replay_not_found"}) from None
+    except PublicReplayStoreError:
+        raise HTTPException(
+            status_code=503, detail={"code": "public_replay_store_unavailable"}
+        ) from None
+    if publication.get("game_id") != game_id:
+        raise HTTPException(status_code=404, detail={"code": "public_replay_not_found"})
+    response.headers["Cache-Control"] = "public, max-age=60"
+    response.headers["X-Robots-Tag"] = "noindex, nofollow"
+    return publication
 
 
 @router.get("/runs")
 async def list_runs(request: Request, response: Response) -> Mapping[str, object]:
     response.headers["Cache-Control"] = "no-store"
-    return {"runs": await _lab_runs(request).list_runs()}
+    generic_service = _optional_generic_lab_runs(request)
+    if generic_service is None:
+        labyrinth = await _lab_runs(request).list_runs()
+        generic: list[Mapping[str, Any]] = []
+    else:
+        labyrinth, generic = await asyncio.gather(
+            _lab_runs(request).list_runs(),
+            generic_service.list_runs(),
+        )
+    combined = [*labyrinth, *generic]
+    combined.sort(
+        key=lambda item: (
+            item.get("created_at_epoch_ms", 0),
+            item.get("run_id", ""),
+        ),
+        reverse=True,
+    )
+    return {"runs": combined}
 
 
 @router.get("/runs/{run_id}")
 async def get_run(request: Request, response: Response, run_id: str) -> Mapping[str, object]:
     response.headers["Cache-Control"] = "no-store"
     try:
+        if _is_generic_run_id(run_id):
+            return await _generic_lab_runs(request).get_run(run_id)
         return await _lab_runs(request).get_run(run_id)
-    except LabRunNotFoundError:
+    except (LabRunNotFoundError, GenericLabRunNotFoundError):
         raise HTTPException(status_code=404, detail={"code": "lab_run_not_found"}) from None
 
 
@@ -280,9 +486,49 @@ async def get_run_projection(
 ) -> Mapping[str, object]:
     response.headers["Cache-Control"] = "no-store"
     try:
+        if _is_generic_run_id(run_id):
+            return await _generic_lab_runs(request).projection(run_id)
         return await _lab_runs(request).projection(run_id)
-    except LabRunNotFoundError:
+    except (LabRunNotFoundError, GenericLabRunNotFoundError):
         raise HTTPException(status_code=404, detail={"code": "lab_run_not_found"}) from None
+
+
+@router.get("/runs/{run_id}/frame")
+async def get_run_frame(
+    request: Request,
+    run_id: str,
+    participant: str = "participant_0",
+) -> Response:
+    """Return a sanitized participant PNG for a generic live authority.
+
+    Labyrinth uses its richer JSON spectator feed; every other authority stays behind the same
+    authenticated Lab run identity and never exposes its process-local episode or series id.
+    """
+
+    if not _is_generic_run_id(run_id):
+        raise HTTPException(status_code=409, detail={"code": "lab_run_frame_uses_spectator"})
+    if not isinstance(participant, str) or participant not in {
+        "participant_0",
+        "participant_1",
+        "participant_2",
+    }:
+        raise HTTPException(status_code=422, detail={"code": "invalid_lab_participant"})
+    try:
+        frame = await _generic_lab_runs(request).frame(run_id, participant_id=participant)
+    except GenericLabRunNotFoundError:
+        raise HTTPException(status_code=404, detail={"code": "lab_run_not_found"}) from None
+    except GenericLabRunError:
+        raise HTTPException(status_code=422, detail={"code": "invalid_lab_run_frame"}) from None
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-State": frame.state,
+    }
+    if frame.png is None:
+        return Response(status_code=204, headers=headers)
+    headers["X-Content-SHA256"] = frame.sha256 or ""
+    return Response(content=frame.png, media_type="image/png", headers=headers)
 
 
 @router.get("/runs/{run_id}/spectator")
@@ -296,12 +542,24 @@ async def get_run_spectator(
 
     response.headers["Cache-Control"] = "no-store"
     try:
+        if _is_generic_run_id(run_id):
+            # Generic games expose sanitized participant pixels through /frame.  Keep the shared
+            # polling contract stable without fabricating spatial observer state.
+            await _generic_lab_runs(request).get_run(run_id)
+            cursor = _spectator_cursor(after)
+            return {
+                "schema_version": "worldeval/lab-live-spectator-feed/1",
+                "run_id": run_id,
+                "cursor": cursor,
+                "reset_required": False,
+                "frames": [],
+            }
         return await _lab_runs(request).spectator(run_id, after_sequence=_spectator_cursor(after))
     except ValueError:
         raise HTTPException(
             status_code=422, detail={"code": "invalid_lab_spectator_cursor"}
         ) from None
-    except LabRunNotFoundError:
+    except (LabRunNotFoundError, GenericLabRunNotFoundError):
         raise HTTPException(status_code=404, detail={"code": "lab_run_not_found"}) from None
     except LabRunError:
         raise HTTPException(
@@ -311,6 +569,12 @@ async def get_run_spectator(
 
 @router.get("/runs/{run_id}/video")
 async def get_run_video(request: Request, run_id: str) -> Response:
+    if _is_generic_run_id(run_id):
+        try:
+            await _generic_lab_runs(request).get_run(run_id)
+        except GenericLabRunNotFoundError:
+            raise HTTPException(status_code=404, detail={"code": "lab_run_not_found"}) from None
+        raise HTTPException(status_code=409, detail={"code": "lab_run_video_not_ready"})
     try:
         path = await _lab_runs(request).video_path(run_id)
     except LabRunNotFoundError:
@@ -326,6 +590,134 @@ async def get_run_video(request: Request, run_id: str) -> Response:
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+
+@router.post("/runs/{run_id}/cancel")
+async def cancel_lab_run(request: Request, response: Response, run_id: str) -> Mapping[str, object]:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        if _is_generic_run_id(run_id):
+            return await _generic_lab_runs(request).cancel(run_id)
+        return await _lab_runs(request).cancel(run_id)
+    except (LabRunNotFoundError, GenericLabRunNotFoundError):
+        raise HTTPException(status_code=404, detail={"code": "lab_run_not_found"}) from None
+    except (LabRunError, GenericLabRunError):
+        raise HTTPException(
+            status_code=409, detail={"code": "lab_run_cancel_unavailable"}
+        ) from None
+
+
+@router.post("/runs/{run_id}/seal")
+async def seal_lab_run(request: Request, response: Response, run_id: str) -> Mapping[str, object]:
+    """Freeze a completed cartridge; benchmark admission remains separate."""
+
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        if _is_generic_run_id(run_id):
+            return await _generic_lab_runs(request).seal(run_id)
+        return await _lab_runs(request).seal(run_id)
+    except (LabRunNotFoundError, GenericLabRunNotFoundError):
+        raise HTTPException(status_code=404, detail={"code": "lab_run_not_found"}) from None
+    except (LabRunError, GenericLabRunError):
+        raise HTTPException(status_code=409, detail={"code": "lab_run_seal_unavailable"}) from None
+
+
+@router.post("/runs/{run_id}/verify")
+async def verify_lab_run(request: Request, response: Response, run_id: str) -> Mapping[str, object]:
+    """Validate the durable canonical bindings of one sealed cartridge."""
+
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        if _is_generic_run_id(run_id):
+            return await _generic_lab_runs(request).verify(run_id)
+        return await _lab_runs(request).verify(run_id)
+    except (LabRunNotFoundError, GenericLabRunNotFoundError):
+        raise HTTPException(status_code=404, detail={"code": "lab_run_not_found"}) from None
+    except (LabRunError, GenericLabRunError):
+        raise HTTPException(
+            status_code=409, detail={"code": "lab_run_verify_unavailable"}
+        ) from None
+
+
+@router.post("/runs/{run_id}/benchmark", status_code=201)
+async def submit_lab_run_to_benchmark(
+    request: Request,
+    response: Response,
+    run_id: str,
+    payload: Any = _BODY,
+) -> Mapping[str, object]:
+    """Admit authority-derived metrics from one verified, recipe-compatible cartridge."""
+
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != {"recipe_id"}
+        or not isinstance(payload.get("recipe_id"), str)
+    ):
+        raise HTTPException(status_code=422, detail={"code": "invalid_lab_benchmark_submission"})
+    try:
+        if _is_generic_run_id(run_id):
+            record = await _generic_lab_runs(request).get_run(run_id)
+        else:
+            record = await _lab_runs(request).get_run(run_id)
+        cartridge = record.get("cartridge")
+        projection = cartridge.get("public_projection") if isinstance(cartridge, Mapping) else None
+        snapshot = projection.get("snapshot") if isinstance(projection, Mapping) else None
+        participant_metrics = (
+            snapshot.get("benchmark_metrics") if isinstance(snapshot, Mapping) else None
+        )
+        if not isinstance(participant_metrics, list):
+            raise LabBenchmarkError("verified run has no authority-derived benchmark metrics")
+        accepted = await asyncio.to_thread(
+            _benchmark_store(request).accept,
+            recipe_id=payload["recipe_id"],
+            candidate_run=record,
+            participant_metrics=participant_metrics,
+        )
+    except (LabRunNotFoundError, GenericLabRunNotFoundError):
+        raise HTTPException(status_code=404, detail={"code": "lab_run_not_found"}) from None
+    except LabBenchmarkError:
+        raise HTTPException(
+            status_code=409, detail={"code": "lab_benchmark_submission_unavailable"}
+        ) from None
+    response.headers["Cache-Control"] = "no-store"
+    return accepted
+
+
+@router.post("/runs/{run_id}/publish", status_code=201)
+async def publish_lab_run(
+    request: Request, response: Response, run_id: str
+) -> Mapping[str, object]:
+    """Create an explicit unlisted publication from a safe completed cartridge."""
+
+    try:
+        if _is_generic_run_id(run_id):
+            record = await _generic_lab_runs(request).get_run(run_id)
+        else:
+            record = await _lab_runs(request).get_run(run_id)
+        publication = await asyncio.to_thread(_public_replays(request).publish, record)
+    except (LabRunNotFoundError, GenericLabRunNotFoundError):
+        raise HTTPException(status_code=404, detail={"code": "lab_run_not_found"}) from None
+    except (PublicReplayPublicationError, PublicReplayStoreError):
+        raise HTTPException(
+            status_code=409, detail={"code": "lab_run_publication_unavailable"}
+        ) from None
+    response.headers["Cache-Control"] = "no-store"
+    return publication
+
+
+@router.delete("/publications/{publication_slug}", status_code=204)
+async def unpublish_lab_replay(request: Request, publication_slug: str) -> Response:
+    """Remove an explicit public link while keeping its recoverable private tombstone."""
+
+    try:
+        removed = await asyncio.to_thread(_public_replays(request).unpublish, publication_slug)
+    except (PublicReplayPublicationError, PublicReplayStoreError):
+        raise HTTPException(
+            status_code=409, detail={"code": "lab_replay_unpublish_unavailable"}
+        ) from None
+    if not removed:
+        raise HTTPException(status_code=404, detail={"code": "public_replay_not_found"})
+    return Response(status_code=204, headers={"Cache-Control": "no-store"})
 
 
 @router.post("/runs/labyrinth", status_code=202)
@@ -373,16 +765,70 @@ async def create_labyrinth_run(
     return record
 
 
+@router.post("/runs/games/{game_id}", status_code=202)
+async def create_generic_game_run(
+    request: Request,
+    response: Response,
+    game_id: str,
+    payload: Any = _BODY,
+) -> Mapping[str, object]:
+    """Launch an admitted existing Godot authority through one Lab contract boundary."""
+
+    try:
+        values = _validate_generic_game_launch(game_id, payload)
+        authority_service, launch = await _start_generic_game_authority(request, values)
+    except (
+        GameCatalogError,
+        GameRuntimeModeUnavailableError,
+        GameRuntimeRegistryError,
+        LabContractError,
+        GenericLabRunError,
+        TypeError,
+        ValueError,
+    ):
+        raise HTTPException(
+            status_code=422, detail={"code": "invalid_lab_game_run_request"}
+        ) from None
+    except Exception:
+        raise HTTPException(
+            status_code=503, detail={"code": "lab_game_launch_unavailable"}
+        ) from None
+
+    try:
+        record = await _generic_lab_runs(request).attach(launch)
+    except Exception:
+        # The existing service owns any session credential after create succeeds.  Ensure a
+        # persistence failure cannot leave an untracked provider authority consuming calls.
+        try:
+            await authority_service.cancel(launch.source_id)
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=503, detail={"code": "lab_game_launch_unavailable"}
+        ) from None
+    response.headers["Cache-Control"] = "no-store"
+    return record
+
+
 @router.post("/runs/{run_id}/clone", status_code=201)
 async def clone_run(
     request: Request, response: Response, run_id: str, payload: Any = _BODY
 ) -> Mapping[str, object]:
     try:
         changes = _validate_clone_payload(payload)
-        record = await _lab_runs(request).clone(run_id, changes=changes)
-    except LabRunNotFoundError:
+        if _is_generic_run_id(run_id):
+            record = await _generic_lab_runs(request).clone(run_id, changes=changes)
+        else:
+            record = await _lab_runs(request).clone(run_id, changes=changes)
+    except (LabRunNotFoundError, GenericLabRunNotFoundError):
         raise HTTPException(status_code=404, detail={"code": "lab_run_not_found"}) from None
-    except (LabContractError, LabRunError, TypeError, ValueError):
+    except (
+        LabContractError,
+        LabRunError,
+        GenericLabRunError,
+        TypeError,
+        ValueError,
+    ):
         raise HTTPException(
             status_code=422, detail={"code": "invalid_lab_run_clone_request"}
         ) from None
@@ -399,6 +845,11 @@ async def launch_draft_run(
     This is intentionally not a resume API: the draft's immutable contract and parent lineage are
     retained, while a new process-local live episode receives a newly supplied session credential.
     """
+
+    if _is_generic_run_id(run_id):
+        record = await _launch_generic_draft_run(request, run_id, payload)
+        response.headers["Cache-Control"] = "no-store"
+        return record
 
     try:
         api_key = _validate_draft_launch_payload(payload)
@@ -453,10 +904,424 @@ async def launch_draft_run(
     return record
 
 
-@router.get("/benchmarks/labyrinth-run")
-async def labyrinth_benchmark_status(request: Request, response: Response) -> Mapping[str, object]:
+@router.get("/benchmarks/model-profiles")
+async def benchmark_model_profiles(request: Request, response: Response) -> Mapping[str, object]:
     response.headers["Cache-Control"] = "no-store"
-    return _lab_runs(request).benchmark_status()
+    return {"profiles": await asyncio.to_thread(_benchmark_store(request).model_profiles)}
+
+
+@router.get("/benchmarks/{game_id}")
+async def benchmark_status(
+    request: Request, response: Response, game_id: str
+) -> Mapping[str, object]:
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        game_spec(game_id)
+    except GameCatalogError:
+        raise HTTPException(status_code=404, detail={"code": "lab_game_not_found"}) from None
+    store = _optional_benchmark_store(request)
+    if store is not None:
+        try:
+            return await asyncio.to_thread(store.game_status, game_id)
+        except LabBenchmarkError:
+            raise HTTPException(
+                status_code=503, detail={"code": "lab_benchmark_store_unavailable"}
+            ) from None
+    if game_id == "labyrinth-run":
+        return _lab_runs(request).benchmark_status()
+    return {
+        "game_id": game_id,
+        "season_state": "not_available",
+        "verified_results": [],
+        "message": "No verified benchmark recipe is available for this game.",
+    }
+
+
+def _validated_models(value: object, *, count: int) -> tuple[str, ...]:
+    if (
+        not isinstance(value, list)
+        or len(value) != count
+        or any(
+            not isinstance(model, str) or _SAFE_MODEL.fullmatch(model) is None for model in value
+        )
+    ):
+        raise ValueError("Lab game models are invalid")
+    models = tuple(value)
+    # Model identifiers are persisted into contracts and public run receipts. Validate them
+    # before an authority/provider sees the requested model so a credential accidentally pasted
+    # into this field can never become a durable or browser-visible artifact.
+    for index, model in enumerate(models):
+        RunEntrant(entrant_id=f"entrant_{index}", model_id=model)
+    return models
+
+
+def _generic_launch_values_from_contract(contract: RunContract, payload: object) -> dict[str, Any]:
+    """Reconstruct a fresh launch only from a compatible frozen draft contract."""
+
+    body = contract.as_dict()
+    configuration = body.get("configuration")
+    if not isinstance(configuration, Mapping):
+        raise ValueError("Generic Lab draft configuration is invalid")
+    profile_id = configuration.get("runtime_profile_id")
+    if not isinstance(profile_id, str):
+        raise ValueError("Generic Lab draft runtime profile is invalid")
+    profile = runtime_profile(profile_id)
+    if not profile.launchable or profile.mode not in {"live", "demo"}:
+        raise ValueError("Generic Lab draft runtime profile is not launchable")
+    if (
+        body.get("game_version") != profile.canonical_task_id
+        or body.get("scenario_id")
+        != (profile.canonical_scenario_id if profile.mode == "demo" else None)
+        or body.get("runtime_version") != f"godot-{profile.protocol_version.replace('/', '-')}"
+        or configuration.get("authority_kind") != profile.authority_kind
+        or configuration.get("protocol_version") != profile.protocol_version
+    ):
+        raise ValueError("Generic Lab draft authority binding differs")
+    try:
+        resolved = resolve_runtime_launch(str(body.get("game_id")), profile.mode)
+    except GameRuntimeRegistryError as error:
+        raise ValueError("Generic Lab draft game binding is unavailable") from error
+    if resolved.profile_id != profile.profile_id:
+        raise ValueError("Generic Lab draft profile is no longer admitted")
+    expected_mode = "demo" if profile.mode == "demo" else "exploratory"
+    if body.get("mode") != expected_mode:
+        raise ValueError("Generic Lab draft evidence mode differs")
+
+    seed_policy = body.get("seed_policy")
+    if (
+        not isinstance(seed_policy, Mapping)
+        or set(seed_policy) != {"kind", "seed"}
+        or seed_policy.get("kind") != "fixed_seed"
+    ):
+        raise ValueError("Generic Lab draft seed policy is invalid")
+    seed = seed_policy.get("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 2_147_483_647:
+        raise ValueError("Generic Lab draft seed is invalid")
+
+    raw_entrants = body.get("entrants")
+    if not isinstance(raw_entrants, list) or len(raw_entrants) != profile.participant_count:
+        raise ValueError("Generic Lab draft entrants are invalid")
+    entrants = tuple(RunEntrant.from_dict(value) for value in raw_entrants)
+    providers = {entrant.provider for entrant in entrants}
+    models = tuple(entrant.model_id for entrant in entrants)
+    if profile.mode == "demo":
+        if payload != {} or providers != {"demo"}:
+            raise ValueError("Generic Demo draft is credential-free")
+        provider = "demo"
+        api_key = None
+    else:
+        if not isinstance(payload, dict) or set(payload) != {"api_key"}:
+            raise ValueError("Generic live draft requires one session credential")
+        if len(providers) != 1:
+            raise ValueError("Generic Lab draft providers differ")
+        provider = next(iter(providers))
+        if provider not in _GENERIC_SESSION_PROVIDERS or provider not in profile.providers:
+            raise ValueError("Generic Lab draft provider is unavailable")
+        api_key = _validate_session_api_key(payload["api_key"])
+
+    budget = body.get("budget")
+    if not isinstance(budget, Mapping):
+        raise ValueError("Generic Lab draft budget is invalid")
+    if profile.authority_kind == "solo_episode":
+        if set(budget) != {"maximum_ticks", "scope"} or budget.get("scope") != "episode":
+            raise ValueError("Generic solo draft budget is invalid")
+        maximum_ticks = budget.get("maximum_ticks")
+        if (
+            isinstance(maximum_ticks, bool)
+            or not isinstance(maximum_ticks, int)
+            or not 1 <= maximum_ticks <= 18_000
+        ):
+            raise ValueError("Generic solo draft budget is invalid")
+        max_provider_calls = 2_160
+    else:
+        rotations = 3 if profile.authority_kind == "trio_series" else 2
+        limit = 1_080 if rotations == 3 else 2_160
+        if (
+            set(budget) != {"maximum_provider_calls", "rotations", "scope"}
+            or budget.get("scope") != "series"
+            or budget.get("rotations") != rotations
+        ):
+            raise ValueError("Generic series draft budget is invalid")
+        max_provider_calls = budget.get("maximum_provider_calls")
+        if (
+            isinstance(max_provider_calls, bool)
+            or not isinstance(max_provider_calls, int)
+            or not 1 <= max_provider_calls <= limit
+        ):
+            raise ValueError("Generic series draft budget is invalid")
+        maximum_ticks = 0
+    return {
+        "api_key": api_key,
+        "game_id": body["game_id"],
+        "max_provider_calls": max_provider_calls,
+        "maximum_ticks": maximum_ticks,
+        "mode": profile.mode,
+        "models": models,
+        "profile": profile,
+        "provider": provider,
+        "seed": seed,
+    }
+
+
+async def _launch_generic_draft_run(
+    request: Request, run_id: str, payload: object
+) -> Mapping[str, object]:
+    runs = _generic_lab_runs(request)
+    try:
+        inspected = await runs.inspect_draft_launch(run_id)
+        values = _generic_launch_values_from_contract(inspected, payload)
+        contract = await runs.reserve_draft_launch(run_id)
+        if contract.contract_sha256 != inspected.contract_sha256:
+            raise GenericLabRunError("generic Lab draft changed during reservation")
+    except GenericLabRunNotFoundError:
+        raise HTTPException(status_code=404, detail={"code": "lab_run_not_found"}) from None
+    except (
+        GameRuntimeRegistryError,
+        GenericLabRunError,
+        LabContractError,
+        TypeError,
+        ValueError,
+    ):
+        raise HTTPException(
+            status_code=422, detail={"code": "invalid_lab_run_launch_request"}
+        ) from None
+
+    authority_service: Any | None = None
+    source_id: str | None = None
+    try:
+        authority_service, launch = await _start_generic_game_authority(request, values)
+        source_id = launch.source_id
+        return await runs.attach_reserved_authority(run_id, source_id=source_id)
+    except Exception:
+        if authority_service is not None and source_id is not None:
+            try:
+                await authority_service.cancel(source_id)
+            except Exception:
+                pass
+        try:
+            await runs.fail_reserved_draft_launch(run_id)
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=503, detail={"code": "lab_game_launch_unavailable"}
+        ) from None
+
+
+def _validate_generic_game_launch(game_id: str, payload: object) -> dict[str, Any]:
+    """Validate one uniform launch request without reflecting credential material."""
+
+    allowed = {
+        "api_key",
+        "max_provider_calls",
+        "maximum_ticks",
+        "mode",
+        "models",
+        "provider",
+        "seed",
+    }
+    if not isinstance(payload, dict) or set(payload) - allowed:
+        raise ValueError("Lab game launch fields are invalid")
+    game_spec(game_id)
+    mode = payload.get("mode")
+    if mode not in {"live", "demo"}:
+        raise ValueError("Lab game launch mode is invalid")
+    profile = resolve_runtime_launch(game_id, mode)
+    if profile.authority_kind not in {
+        "solo_episode",
+        "paired_series",
+        "trio_series",
+    }:
+        raise ValueError("Lab game authority is not admitted through this endpoint")
+    if profile.canonical_task_id is None:
+        raise ValueError("Lab game task is invalid")
+    seed = payload.get("seed", 7)
+    if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 2_147_483_647:
+        raise ValueError("Lab game seed is invalid")
+
+    if mode == "demo":
+        if set(payload).intersection({"api_key", "provider", "models"}):
+            raise ValueError("Demo launch is frozen and credential-free")
+        provider = "demo"
+        api_key = None
+        if profile.authority_kind == "solo_episode":
+            scenario = demo_scenario(profile.canonical_scenario_id or "")
+            models = (scenario.provider_model,)
+            maximum_ticks = scenario.episode_tick_budget
+        elif profile.authority_kind == "paired_series":
+            models = duo_game(profile.canonical_task_id).models
+            if len(models) != 2:
+                raise ValueError("Paired Demo policy is unavailable")
+            maximum_ticks = duo_game(profile.canonical_task_id).maximum_episode_ticks
+        else:
+            models = tuple(entrant.model for entrant in TRIO_DEMO_ENTRANTS)
+            maximum_ticks = 0
+    else:
+        provider = payload.get("provider", "openai")
+        if provider not in _GENERIC_SESSION_PROVIDERS or provider not in profile.providers:
+            raise ValueError("Lab game provider is invalid")
+        api_key = _validate_session_api_key(payload.get("api_key"))
+        models = _validated_models(payload.get("models"), count=profile.participant_count)
+        maximum_ticks = payload.get("maximum_ticks", 1_800)
+        if profile.authority_kind == "solo_episode" and (
+            isinstance(maximum_ticks, bool)
+            or not isinstance(maximum_ticks, int)
+            or not 1 <= maximum_ticks <= 18_000
+        ):
+            raise ValueError("Lab game tick budget is invalid")
+    max_provider_calls = payload.get(
+        "max_provider_calls",
+        1_080 if profile.authority_kind == "trio_series" else 2_160,
+    )
+    maximum_call_limit = 1_080 if profile.authority_kind == "trio_series" else 2_160
+    if profile.authority_kind != "solo_episode" and (
+        isinstance(max_provider_calls, bool)
+        or not isinstance(max_provider_calls, int)
+        or not 1 <= max_provider_calls <= maximum_call_limit
+    ):
+        raise ValueError("Lab game provider-call budget is invalid")
+    if profile.authority_kind == "solo_episode" and "max_provider_calls" in payload:
+        raise ValueError("Solo game does not accept a series call budget")
+    if profile.authority_kind != "solo_episode" and "maximum_ticks" in payload:
+        raise ValueError("Series game does not accept a solo tick budget")
+    return {
+        "api_key": api_key,
+        "game_id": game_id,
+        "max_provider_calls": max_provider_calls,
+        "maximum_ticks": maximum_ticks,
+        "mode": mode,
+        "models": models,
+        "profile": profile,
+        "provider": provider,
+        "seed": seed,
+    }
+
+
+async def _start_generic_game_authority(
+    request: Request, values: Mapping[str, Any]
+) -> tuple[Any, AttachedGameRun]:
+    profile = values.get("profile")
+    if not isinstance(profile, GameRuntimeProfile) or profile.canonical_task_id is None:
+        raise ValueError("Lab game runtime profile is invalid")
+    authority = _generic_authority_service(request, profile.authority_kind)
+    provider = str(values["provider"])
+    models = tuple(values["models"])
+    seed = int(values["seed"])
+    task_id = profile.canonical_task_id
+
+    if profile.authority_kind == "solo_episode":
+        created = await authority.create(
+            provider=provider,
+            model=models[0],
+            task_id=task_id,
+            seed=seed,
+            api_key=values["api_key"],
+            maximum_episode_ticks=values["maximum_ticks"],
+            scenario_id=profile.canonical_scenario_id if values["mode"] == "demo" else None,
+        )
+        source_id = created.get("episode_id") if isinstance(created, Mapping) else None
+        entrants = (
+            RunEntrant(
+                entrant_id="entrant_0",
+                model_id=models[0],
+                provider=provider,
+                display_name="Agent",
+            ),
+        )
+        budget = {
+            "maximum_ticks": values["maximum_ticks"],
+            "scope": "episode",
+        }
+        configuration: dict[str, object] = {
+            "interface_profile": "hybrid-visible-v1",
+            "protocol_version": profile.protocol_version,
+            "runtime_profile_id": profile.profile_id,
+        }
+    elif profile.authority_kind == "paired_series":
+        authority_entrants = tuple(
+            (
+                {"provider": provider, "model": model}
+                if provider == "demo"
+                else {
+                    "provider": provider,
+                    "model": model,
+                    "api_key": values["api_key"],
+                }
+            )
+            for model in models
+        )
+        created = await authority.create(
+            entrants=authority_entrants,
+            seed=seed,
+            max_live_provider_calls=values["max_provider_calls"],
+            task_id=task_id,
+        )
+        source_id = created.get("series_id") if isinstance(created, Mapping) else None
+        entrants = tuple(
+            RunEntrant(
+                entrant_id=f"entrant_{index}",
+                model_id=model,
+                provider=provider,
+                display_name=("Alpha", "Bravo")[index],
+            )
+            for index, model in enumerate(models)
+        )
+        budget = {
+            "maximum_provider_calls": values["max_provider_calls"],
+            "rotations": 2,
+            "scope": "series",
+        }
+        configuration = {
+            "protocol_version": profile.protocol_version,
+            "runtime_profile_id": profile.profile_id,
+            "seat_rotation": "symmetric-two-leg",
+        }
+    else:
+        authority_entrants = tuple(
+            {"provider": "demo", "model": entrant.model} for entrant in TRIO_DEMO_ENTRANTS
+        )
+        created = await authority.create(
+            task_id=task_id,
+            seed=seed,
+            entrants=authority_entrants,
+            max_provider_calls=values["max_provider_calls"],
+        )
+        source_id = created.get("series_id") if isinstance(created, Mapping) else None
+        entrants = tuple(
+            RunEntrant(
+                entrant_id=entrant.entrant_id,
+                model_id=entrant.model,
+                provider="demo",
+                display_name=entrant.display_name,
+            )
+            for entrant in TRIO_DEMO_ENTRANTS
+        )
+        budget = {
+            "maximum_provider_calls": values["max_provider_calls"],
+            "rotations": 3,
+            "scope": "series",
+        }
+        configuration = {
+            "protocol_version": profile.protocol_version,
+            "runtime_profile_id": profile.profile_id,
+            "seat_rotation": "cyclic-three-leg",
+        }
+
+    if not isinstance(source_id, str):
+        raise RuntimeError("Lab game authority identity is invalid")
+    launch = AttachedGameRun(
+        authority_kind=profile.authority_kind,
+        source_id=source_id,
+        game_id=str(values["game_id"]),
+        game_version=task_id,
+        runtime_version=f"godot-{profile.protocol_version.replace('/', '-')}",
+        scenario_id=profile.canonical_scenario_id if values["mode"] == "demo" else None,
+        entrants=entrants,
+        seed=seed,
+        budget=budget,
+        configuration=configuration,
+        mode=RunMode.DEMO if values["mode"] == "demo" else RunMode.EXPLORATORY,
+    )
+    return authority, launch
 
 
 def _validate_labyrinth_launch(payload: object) -> dict[str, Any]:

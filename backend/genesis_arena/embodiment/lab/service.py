@@ -138,6 +138,26 @@ _LIVE_OBSERVER_RACER_FIELDS = frozenset(
         "finished",
     }
 )
+_BENCHMARK_METRIC_FIELDS = frozenset(
+    {
+        "budget_charged_calls",
+        "completion_basis_points",
+        "input_tokens",
+        "invalid_action_rate_basis_points",
+        "latency_ms",
+        "output_tokens",
+        "path_efficiency_basis_points",
+        "recovery_rate_basis_points",
+    }
+)
+_BENCHMARK_BASIS_POINT_FIELDS = frozenset(
+    {
+        "completion_basis_points",
+        "invalid_action_rate_basis_points",
+        "path_efficiency_basis_points",
+        "recovery_rate_basis_points",
+    }
+)
 _MAX_LIVE_SPECTATOR_MAP_CELLS = 4_096
 
 
@@ -163,6 +183,8 @@ class LiveLabyrinthProjectionSource(Protocol):
     async def spectator_frames(
         self, episode_id: str, *, after_sequence: int = 0
     ) -> Mapping[str, Any]: ...
+
+    async def cancel(self, episode_id: str) -> Mapping[str, object]: ...
 
 
 @dataclass(frozen=True)
@@ -207,6 +229,56 @@ def _nonnegative_int(value: object, *, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise LabRunError(f"{label} is invalid")
     return value
+
+
+def _safe_benchmark_metrics(value: object, *, contract: RunContract) -> list[dict[str, object]]:
+    """Bind authority-derived numeric metrics to the frozen entrant roster."""
+
+    body = contract.as_dict()
+    entrants = body.get("entrants")
+    budget = body.get("budget")
+    if (
+        not isinstance(value, (list, tuple))
+        or not isinstance(entrants, list)
+        or not isinstance(budget, Mapping)
+    ):
+        raise LabRunError("live labyrinth benchmark metrics are invalid")
+    participant_budget = _nonnegative_int(
+        budget.get("participant_call_budget"),
+        label="live labyrinth participant call budget",
+    )
+    expected_ids = [entrant.get("entrant_id") for entrant in entrants]
+    if len(value) != len(expected_ids):
+        raise LabRunError("live labyrinth benchmark metrics are incomplete")
+    projected: list[dict[str, object]] = []
+    for index, item in enumerate(value):
+        if (
+            not isinstance(item, Mapping)
+            or set(item) != {"entrant_id", "metrics"}
+            or item.get("entrant_id") != expected_ids[index]
+            or not isinstance(item.get("metrics"), Mapping)
+            or set(item["metrics"]) != _BENCHMARK_METRIC_FIELDS
+        ):
+            raise LabRunError("live labyrinth benchmark metrics differ")
+        metrics = {
+            name: _nonnegative_int(
+                item["metrics"][name],
+                label=f"live labyrinth benchmark metric {name}",
+            )
+            for name in sorted(_BENCHMARK_METRIC_FIELDS)
+        }
+        if metrics["budget_charged_calls"] > participant_budget or any(
+            metrics[name] > 10_000 for name in _BENCHMARK_BASIS_POINT_FIELDS
+        ):
+            raise LabRunError("live labyrinth benchmark metrics exceed the contract")
+        projected.append(
+            {
+                "entrant_id": str(item["entrant_id"]),
+                "metrics": metrics,
+            }
+        )
+    assert_public_projection_safe(projected, path="live_labyrinth.benchmark_metrics")
+    return projected
 
 
 def _safe_spectator_frame(value: object, *, record: _LabRunRecord) -> dict[str, Any]:
@@ -396,13 +468,18 @@ class LabRunService:
         self._root = Path(runs_dir) / _RUNS_DIRECTORY_NAME
         self._live_labyrinth = live_labyrinth
         self._records: dict[str, _LabRunRecord] = {}
-        self._lock = asyncio.Lock()
+        self._lock: asyncio.Lock | None = None
         self._root.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
             os.chmod(self._root, 0o700)
         except OSError:
             pass
         self._load_durable_records()
+
+    def _service_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     @property
     def runs_dir(self) -> Path:
@@ -483,7 +560,7 @@ class LabRunService:
             created_at_epoch_ms=int(time.time() * 1000),
             upstream_available=True,
         )
-        async with self._lock:
+        async with self._service_lock():
             self._records[contract.run_id] = record
             self._persist(record)
         return self._public_record(record)
@@ -493,7 +570,7 @@ class LabRunService:
 
         if not isinstance(changes, Mapping):
             raise LabRunError("Lab run clone changes are invalid")
-        async with self._lock:
+        async with self._service_lock():
             parent = self._record_or_raise(run_id)
             normalized_changes = dict(changes)
             parent_body = parent.contract.as_dict()
@@ -544,7 +621,7 @@ class LabRunService:
         deterministically, while preserving the clone's immutable contract and lineage.
         """
 
-        async with self._lock:
+        async with self._service_lock():
             record = self._record_or_raise(run_id)
             if (
                 record.state.status is not RunLifecycle.DRAFT
@@ -577,7 +654,7 @@ class LabRunService:
 
         if not isinstance(episode_id, str) or not episode_id.startswith("ep_"):
             raise LabRunError("Labyrinth episode identity is invalid")
-        async with self._lock:
+        async with self._service_lock():
             record = self._record_or_raise(run_id)
             if (
                 record.state.status is not RunLifecycle.QUEUED
@@ -603,7 +680,7 @@ class LabRunService:
         credentials remain in the API/authority boundary and never cross into a cartridge.
         """
 
-        async with self._lock:
+        async with self._service_lock():
             record = self._record_or_raise(run_id)
             if record.state.status is RunLifecycle.FAILED:
                 return
@@ -628,7 +705,7 @@ class LabRunService:
     async def list_runs(self) -> list[Mapping[str, Any]]:
         """Return safe summaries ordered by creation time, newest first."""
 
-        async with self._lock:
+        async with self._service_lock():
             records = sorted(
                 self._records.values(),
                 key=lambda item: (item.created_at_epoch_ms, item.contract.run_id),
@@ -718,6 +795,79 @@ class LabRunService:
             record.video_state = "unavailable"
         return archived
 
+    async def cancel(self, run_id: str) -> Mapping[str, Any]:
+        """Cancel one in-flight authority without exposing its episode capability."""
+
+        record = await self._get_record(run_id)
+        if record.state.status in {
+            RunLifecycle.COMPLETED,
+            RunLifecycle.FAILED,
+            RunLifecycle.CANCELLED,
+            RunLifecycle.SEALED,
+            RunLifecycle.VERIFIED,
+        }:
+            return self._public_record(record)
+        if (
+            record.episode_id is None
+            or not record.upstream_available
+            or self._live_labyrinth is None
+        ):
+            raise LabRunError("Live Labyrinth authority is unavailable")
+        cancel = getattr(self._live_labyrinth, "cancel", None)
+        if not callable(cancel):
+            raise LabRunError("Live Labyrinth authority cannot be cancelled")
+        try:
+            await cancel(record.episode_id)
+        except LiveLabyrinthNotFoundError as error:
+            record.upstream_available = False
+            self._persist(record)
+            raise LabRunError("Live Labyrinth authority is unavailable") from error
+        # Setting the authority cancellation event is only a request. A decision may already have
+        # sealed, or provider cleanup may be in progress, so only the authority's subsequently
+        # observed lifecycle may decide whether this cartridge is cancelled or completed.
+        await self._synchronize(record)
+        return self._public_record(record)
+
+    async def seal(self, run_id: str) -> Mapping[str, Any]:
+        """Freeze one completed Labyrinth cartridge without ranking it."""
+
+        record = await self._get_record(run_id)
+        await self._synchronize(record)
+        async with self._service_lock():
+            record = self._record_or_raise(run_id)
+            if record.state.status in {RunLifecycle.SEALED, RunLifecycle.VERIFIED}:
+                self._revalidate_durable_evidence(record)
+                return self._public_record(record)
+            if record.state.status is not RunLifecycle.COMPLETED:
+                raise LabRunError("Only a completed Labyrinth run can be sealed")
+            replacement = self._evidence_lifecycle_replacement(
+                record,
+                RunLifecycle.SEALED,
+            )
+            self._commit_evidence_replacement(replacement)
+            self._records[run_id] = replacement
+            return self._public_record(replacement)
+
+    async def verify(self, run_id: str) -> Mapping[str, Any]:
+        """Verify canonical durable bindings for one sealed Labyrinth cartridge."""
+
+        await self._get_record(run_id)
+        async with self._service_lock():
+            record = self._record_or_raise(run_id)
+            if record.state.status is RunLifecycle.VERIFIED:
+                self._revalidate_durable_evidence(record)
+                return self._public_record(record)
+            if record.state.status is not RunLifecycle.SEALED:
+                raise LabRunError("Only a sealed Labyrinth run can be verified")
+            self._assert_evidence_bindings(record)
+            replacement = self._evidence_lifecycle_replacement(
+                record,
+                RunLifecycle.VERIFIED,
+            )
+            self._commit_evidence_replacement(replacement)
+            self._records[run_id] = replacement
+            return self._public_record(replacement)
+
     def benchmark_status(self) -> Mapping[str, object]:
         """Be explicit that no Lab-run result is verified until a recipe is implemented."""
 
@@ -732,7 +882,7 @@ class LabRunService:
         }
 
     async def _get_record(self, run_id: str) -> _LabRunRecord:
-        async with self._lock:
+        async with self._service_lock():
             return self._record_or_raise(run_id)
 
     def _record_or_raise(self, run_id: str) -> _LabRunRecord:
@@ -748,7 +898,13 @@ class LabRunService:
             record.episode_id is None
             or not record.upstream_available
             or self._live_labyrinth is None
-            or record.state.status in {RunLifecycle.FAILED, RunLifecycle.CANCELLED}
+            or record.state.status
+            in {
+                RunLifecycle.FAILED,
+                RunLifecycle.CANCELLED,
+                RunLifecycle.SEALED,
+                RunLifecycle.VERIFIED,
+            }
         ):
             return
         try:
@@ -777,7 +933,11 @@ class LabRunService:
             await self._archive_completed_video(record, status=status)
             return
         if target in {RunLifecycle.FAILED, RunLifecycle.CANCELLED}:
-            failure_code = _safe_live_failure_code(status.get("failure"))
+            failure_code = (
+                "lab_run_cancelled"
+                if target is RunLifecycle.CANCELLED
+                else _safe_live_failure_code(status.get("failure"))
+            )
             self._advance_lifecycle(record, target, failure_code=failure_code)
             self._persist(record)
             return
@@ -802,6 +962,12 @@ class LabRunService:
         snapshot = {
             key: value for key, value in safe_replay.items() if key not in {"episode_id", "events"}
         }
+        benchmark_metrics = getattr(self._live_labyrinth, "benchmark_metrics", None)
+        if callable(benchmark_metrics):
+            snapshot["benchmark_metrics"] = _safe_benchmark_metrics(
+                await benchmark_metrics(record.episode_id),
+                contract=record.contract,
+            )
         result_sha256 = canonical_sha256(safe_replay)
         self._advance_lifecycle(
             record,
@@ -917,6 +1083,94 @@ class LabRunService:
         if current is target:
             return
         raise LabRunError("Live Labyrinth returned an impossible lifecycle transition")
+
+    def _evidence_lifecycle_replacement(
+        self,
+        record: _LabRunRecord,
+        target: RunLifecycle,
+    ) -> _LabRunRecord:
+        state = record.state.transition(target)
+        projection_body = record.projection.as_dict()
+        projection = ReplayProjection.create(
+            run_id=record.contract.run_id,
+            contract_sha256=record.contract.contract_sha256,
+            status=state.status,
+            sequence=state.checkpoint_sequence,
+            snapshot=projection_body["snapshot"],
+            events=projection_body["events"],
+        )
+        return _LabRunRecord(
+            contract=record.contract,
+            state=state,
+            projection=projection,
+            cartridge=RaceCartridge.create(
+                cartridge_id=f"cartridge_{record.contract.run_id}",
+                contract=record.contract,
+                state=state,
+                public_projection=projection,
+            ),
+            episode_id=record.episode_id,
+            created_at_epoch_ms=record.created_at_epoch_ms,
+            upstream_available=record.upstream_available,
+            video_state=record.video_state,
+        )
+
+    def _commit_evidence_replacement(self, replacement: _LabRunRecord) -> None:
+        """Persist and read back a replacement before it may become the live record."""
+
+        try:
+            self._persist(replacement)
+            persisted = self._read_durable_record(
+                self._record_directory(replacement.contract.run_id)
+            )
+            self._assert_persisted_evidence_matches(replacement, persisted)
+        except (LabContractError, LabRunError, OSError, TypeError, ValueError) as error:
+            raise LabRunError("Labyrinth evidence could not be persisted") from error
+
+    def _revalidate_durable_evidence(self, record: _LabRunRecord) -> None:
+        """Make idempotent sealed/verified reads prove the durable bundle still matches."""
+
+        try:
+            persisted = self._read_durable_record(
+                self._record_directory(record.contract.run_id)
+            )
+            self._assert_persisted_evidence_matches(record, persisted)
+        except (LabContractError, LabRunError, OSError, TypeError, ValueError) as error:
+            raise LabRunError("Labyrinth durable evidence is unavailable") from error
+
+    @classmethod
+    def _assert_persisted_evidence_matches(
+        cls,
+        expected: _LabRunRecord,
+        persisted: _LabRunRecord,
+    ) -> None:
+        cls._assert_evidence_bindings(persisted)
+        if (
+            persisted.contract != expected.contract
+            or persisted.state != expected.state
+            or persisted.projection != expected.projection
+            or persisted.cartridge != expected.cartridge
+            or persisted.created_at_epoch_ms != expected.created_at_epoch_ms
+        ):
+            raise LabRunError("Labyrinth durable evidence differs")
+
+    @staticmethod
+    def _assert_evidence_bindings(record: _LabRunRecord) -> None:
+        contract = RunContract.from_dict(record.contract.as_dict())
+        state = RunState.from_dict(record.state.as_dict())
+        projection = ReplayProjection.from_dict(record.projection.as_dict())
+        cartridge = RaceCartridge.from_dict(record.cartridge.as_dict())
+        if (
+            contract.contract_sha256 != state.contract_sha256
+            or state.run_id != contract.run_id
+            or projection.run_id != contract.run_id
+            or projection.contract_sha256 != contract.contract_sha256
+            or projection.status is not state.status
+            or projection.sequence != state.checkpoint_sequence
+            or cartridge.state != state
+            or cartridge.public_projection != projection
+        ):
+            raise LabRunError("Labyrinth evidence bindings differ")
 
     def _new_record(
         self,
@@ -1228,9 +1482,13 @@ class LabRunService:
         return self._record_directory(record.contract.run_id) / _VIDEO_FILE
 
     def _archived_video_path(self, record: _LabRunRecord) -> Path | None:
-        """Return a strict archive path only for a completed public run."""
+        """Return a strict archive path for a completed public-evidence lifecycle."""
 
-        if record.state.status is not RunLifecycle.COMPLETED:
+        if record.state.status not in {
+            RunLifecycle.COMPLETED,
+            RunLifecycle.SEALED,
+            RunLifecycle.VERIFIED,
+        }:
             return None
         return self._validated_public_video_path(self._video_artifact_path(record))
 
@@ -1527,7 +1785,8 @@ class LabRunService:
         summary = {
             "authority_available": record.upstream_available,
             "created_at_epoch_ms": record.created_at_epoch_ms,
-            "replay_available": record.state.status is RunLifecycle.COMPLETED,
+            "replay_available": record.state.status
+            in {RunLifecycle.COMPLETED, RunLifecycle.SEALED, RunLifecycle.VERIFIED},
             "resume_supported": False,
             "run_id": record.contract.run_id,
             "video_available": record.video_state == "ready",

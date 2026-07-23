@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
 
 from .artifacts import EpisodeArtifactBundle, EpisodeBundles
+from .control_games.movement_maze_demo import MOVEMENT_MAZE_SCENARIO_ID
+from .control_games.operator_action_course_demo import OPERATOR_ACTION_COURSE_SCENARIO_ID
 from .credentials import InMemoryCredentialStore, SessionCredential
 from .demo_provider import DemoPolicyLock
 from .demo_scenarios import demo_scenario, demo_scenario_fixture_bytes
@@ -38,6 +40,9 @@ _PROVIDERS = frozenset(
 )
 _SAFE_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 _SAFE_TASK = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_PROTOCOL_V2_CONTROL_TASKS = frozenset(
+    (MOVEMENT_MAZE_SCENARIO_ID, OPERATOR_ACTION_COURSE_SCENARIO_ID)
+)
 
 
 class EpisodeServiceError(RuntimeError):
@@ -155,6 +160,8 @@ class EpisodeRunSpec:
     def protocol_version(self) -> str:
         if self.provider == DEMO_PROVIDER and self.scenario_id is not None:
             return demo_scenario(self.scenario_id).protocol_version
+        if self.task_id in _PROTOCOL_V2_CONTROL_TASKS:
+            return "llm-controller/0.2.0"
         return "llm-controller/0.1.0"
 
 
@@ -350,7 +357,15 @@ class EpisodeService:
         self._credentials = credentials or InMemoryCredentialStore()
         self._replay_archive = replay_archive
         self._records: Dict[str, _EpisodeRecord] = {}
-        self._lock = asyncio.Lock()
+        # Construction is synchronous (FastAPI setup and test factories both create services
+        # before an event loop is running).  Python 3.9 eagerly asks for a current loop when an
+        # asyncio.Lock is constructed, so bind the lock lazily on the first async operation.
+        self._lock: asyncio.Lock | None = None
+
+    def _service_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def create(
         self,
@@ -405,7 +420,7 @@ class EpisodeService:
             credential = self._credentials.get(ref)
         record = _EpisodeRecord(spec=spec)
         record.timeline.append({"kind": "episode_queued", "sequence": 0})
-        async with self._lock:
+        async with self._service_lock():
             self._records[episode_id] = record
             record.task = asyncio.create_task(
                 self._execute(record, credential),
@@ -637,7 +652,7 @@ class EpisodeService:
         return self._status(record)
 
     async def aclose(self) -> None:
-        async with self._lock:
+        async with self._service_lock():
             records = tuple(self._records.values())
         for record in records:
             if record.task is not None and not record.task.done():
@@ -662,7 +677,7 @@ class EpisodeService:
         self._credentials.close()
 
     async def _record(self, episode_id: str) -> _EpisodeRecord:
-        async with self._lock:
+        async with self._service_lock():
             record = self._records.get(episode_id)
         if record is None:
             raise EpisodeNotFoundError()

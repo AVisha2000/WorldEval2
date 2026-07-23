@@ -77,7 +77,11 @@ async def test_api_demo_provider_managed_v2_sealed_archive_survives_restart(
             assert response.status_code == 202
             assert "api_key" not in response.text
             series_id = response.json()["series_id"]
-            for _ in range(240):
+            # RTS seals two full 1,200-tick legs and captures both participant frames at every
+            # boundary.  On a modest development machine that is valid but can exceed the
+            # one-minute allowance used by the shorter arena games.
+            poll_attempts = 720 if task_id == "rts-skirmish-v0" else 240
+            for _ in range(poll_attempts):
                 status_response = await client.get(f"/api/embodiment/series/{series_id}")
                 assert status_response.status_code == 200
                 status = status_response.json()
@@ -96,6 +100,20 @@ async def test_api_demo_provider_managed_v2_sealed_archive_survives_restart(
             assert all(leg["run"]["task_id"] == task_id for leg in evaluation["legs"])
             assert all(leg["projection_sha256"] for leg in evaluation["legs"])
             assert "position_mt" not in repr(evaluation)
+            if task_id == "duo-relay-control-v0":
+                aggregates = [
+                    leg["evaluation"]["metrics"]["participant_aggregates"]["value"]
+                    for leg in evaluation["legs"]
+                ]
+                assert sum(
+                    participant["control_ticks"]
+                    for leg in aggregates
+                    for participant in leg.values()
+                ) > 0
+                assert all(
+                    leg["result"]["terminal"]["reason"] == "hold_target"
+                    for leg in evaluation["legs"]
+                )
 
             for participant_id in ("participant_0", "participant_1"):
                 frame = await client.get(
@@ -112,13 +130,23 @@ async def test_api_demo_provider_managed_v2_sealed_archive_survives_restart(
             assert replay.status_code == 200
             assert replay.headers["x-content-sha256"]
             assert b"observation_json_base64" not in replay.content
-            for _ in range(80):
-                archive = (
-                    await client.get(f"/api/embodiment/series/{series_id}/archive")
-                ).json()
-                if archive["evidence"]["state"] != "saving":
-                    break
-                await asyncio.sleep(0.05)
+            archive_poll_attempts = 1_200 if task_id == "rts-skirmish-v0" else 80
+            archive_path = f"/api/embodiment/series/{series_id}/archive"
+            # Archive rendering can keep this test alive for minutes. Use a dedicated
+            # no-keepalive client so polling never depends on the long-lived launch socket after
+            # Uvicorn's normal keep-alive close; every HTTP failure still fails the test.
+            async with httpx.AsyncClient(
+                base_url=f"http://127.0.0.1:{port}",
+                limits=httpx.Limits(max_keepalive_connections=0),
+                timeout=30,
+            ) as archive_client:
+                for _ in range(archive_poll_attempts):
+                    archive_response = await archive_client.get(archive_path)
+                    assert archive_response.status_code == 200
+                    archive = archive_response.json()
+                    if archive["evidence"]["state"] != "saving":
+                        break
+                    await asyncio.sleep(0.05)
             assert archive["evidence"]["state"] == "ready"
             assert archive["native_replay"] == {
                 "state": "unavailable",
@@ -147,3 +175,4 @@ async def test_api_demo_provider_managed_v2_sealed_archive_survives_restart(
         await service.aclose()
         server.should_exit = True
         await server_task
+        listener.close()

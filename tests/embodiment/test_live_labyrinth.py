@@ -15,6 +15,7 @@ from genesis_arena.embodiment.live_labyrinth import (
     MAX_LIVE_SPECTATOR_FRAMES,
     MAX_LIVE_SPECTATOR_PATH_CELLS,
     LiveLabyrinthError,
+    LiveLabyrinthNotReadyError,
     LiveLabyrinthService,
     LiveMazeEntrant,
     MazeNavigationMemory,
@@ -448,7 +449,103 @@ async def test_service_returns_public_entrants_and_runs_cleanup_once() -> None:
         await asyncio.sleep(0)
     assert status["state"] == "completed"
     assert [value["display_name"] for value in status["entrants"]] == ["Sol", "Terra", "Luna"]
+    metrics = await service.benchmark_metrics(created["episode_id"])
+    assert [item["entrant_id"] for item in metrics] == ["sol", "terra", "luna"]
+    assert all(item["metrics"]["completion_basis_points"] == 10_000 for item in metrics)
+    assert all(item["metrics"]["budget_charged_calls"] > 0 for item in metrics)
+    assert all(item["metrics"]["input_tokens"] == 0 for item in metrics)
     assert cleaned == 1
+
+
+@pytest.mark.asyncio
+async def test_service_does_not_publish_completion_before_failing_cleanup_finishes() -> None:
+    choices = _shortest_choices()
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+
+    async def cleanup() -> None:
+        cleanup_started.set()
+        await allow_cleanup.wait()
+        raise RuntimeError("private cleanup detail")
+
+    service = LiveLabyrinthService()
+    created = await service.create(
+        entrants=_entrants(),
+        providers={
+            participant_id: ScriptedMazeProvider(choices)
+            for participant_id in ("participant_0", "participant_1", "participant_2")
+        },
+        max_provider_calls=180,
+        cleanup=cleanup,
+    )
+    episode_id = str(created["episode_id"])
+
+    await asyncio.wait_for(cleanup_started.wait(), timeout=2)
+    assert (await service.status(episode_id))["state"] == "running"
+    for projection in (
+        service.result,
+        service.evaluation,
+        service.benchmark_metrics,
+        service.replay,
+    ):
+        with pytest.raises(LiveLabyrinthNotReadyError):
+            await projection(episode_id)
+
+    allow_cleanup.set()
+    for _ in range(200):
+        status = await service.status(episode_id)
+        if status["state"] not in {"queued", "running"}:
+            break
+        await asyncio.sleep(0)
+
+    assert status["state"] == "failed"
+    assert status["failure"] == "live_labyrinth_cleanup_failed"
+    assert "private cleanup detail" not in repr(status)
+    for projection in (
+        service.result,
+        service.evaluation,
+        service.benchmark_metrics,
+        service.replay,
+    ):
+        with pytest.raises(LiveLabyrinthNotReadyError):
+            await projection(episode_id)
+
+
+@pytest.mark.asyncio
+async def test_service_too_late_cancel_during_cleanup_preserves_completed_result() -> None:
+    choices = _shortest_choices()
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+
+    async def cleanup() -> None:
+        cleanup_started.set()
+        await allow_cleanup.wait()
+
+    service = LiveLabyrinthService()
+    created = await service.create(
+        entrants=_entrants(),
+        providers={
+            participant_id: ScriptedMazeProvider(choices)
+            for participant_id in ("participant_0", "participant_1", "participant_2")
+        },
+        max_provider_calls=180,
+        cleanup=cleanup,
+    )
+    episode_id = str(created["episode_id"])
+
+    await asyncio.wait_for(cleanup_started.wait(), timeout=2)
+    cancellation = await service.cancel(episode_id)
+    assert cancellation["state"] == "running"
+
+    allow_cleanup.set()
+    for _ in range(200):
+        status = await service.status(episode_id)
+        if status["state"] not in {"queued", "running"}:
+            break
+        await asyncio.sleep(0)
+
+    assert status["state"] == "completed"
+    assert (await service.result(episode_id))["winner_id"] is not None
 
 
 @pytest.mark.asyncio

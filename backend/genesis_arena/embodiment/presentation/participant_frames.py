@@ -6,8 +6,10 @@ import asyncio
 import hashlib
 import struct
 import zlib
+from collections import deque
 from dataclasses import dataclass
 from io import BytesIO
+from typing import Generic, TypeVar
 
 from PIL import Image, UnidentifiedImageError
 
@@ -16,6 +18,56 @@ FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
 _RGBA_SCANLINE_BYTES = FRAME_WIDTH * 4 + 1
 _MAX_SOURCE_BYTES = 8 * 1024 * 1024
+_SnapshotT = TypeVar("_SnapshotT")
+
+
+class _NewestAsyncQueue(Generic[_SnapshotT]):
+    """A loop-lazy, depth-one queue for browser preview fan-out.
+
+    Python 3.9 binds ``asyncio.Queue`` to the current event loop during
+    construction. Preview subscriptions are also inspected synchronously by
+    diagnostics and tests, where no loop may exist. This tiny queue preserves
+    the used asyncio queue interface while creating wait primitives only from
+    inside ``get()``, where a running loop is guaranteed.
+    """
+
+    maxsize = 1
+
+    def __init__(self) -> None:
+        self._items: deque[_SnapshotT] = deque()
+        self._waiters: set[asyncio.Event] = set()
+
+    def empty(self) -> bool:
+        return not self._items
+
+    def full(self) -> bool:
+        return bool(self._items)
+
+    def qsize(self) -> int:
+        return len(self._items)
+
+    def get_nowait(self) -> _SnapshotT:
+        if not self._items:
+            raise asyncio.QueueEmpty
+        return self._items.popleft()
+
+    def put_nowait(self, value: _SnapshotT) -> None:
+        if self._items:
+            raise asyncio.QueueFull
+        self._items.append(value)
+        for waiter in tuple(self._waiters):
+            waiter.set()
+
+    async def get(self) -> _SnapshotT:
+        while not self._items:
+            waiter = asyncio.Event()
+            self._waiters.add(waiter)
+            try:
+                if not self._items:
+                    await waiter.wait()
+            finally:
+                self._waiters.discard(waiter)
+        return self.get_nowait()
 
 
 @dataclass(frozen=True)
@@ -65,7 +117,7 @@ class ParticipantPreviewHub:
     """Newest-frame-only local fan-out; it carries participant pixels only."""
 
     def __init__(self) -> None:
-        self._subscribers: dict[int, asyncio.Queue[ParticipantFrameSnapshot]] = {}
+        self._subscribers: dict[int, _NewestAsyncQueue[ParticipantFrameSnapshot]] = {}
         self._next_id = 0
 
     def publish(self, snapshot: ParticipantFrameSnapshot) -> None:
@@ -80,7 +132,7 @@ class ParticipantPreviewHub:
     def subscribe(self) -> tuple[int, asyncio.Queue[ParticipantFrameSnapshot]]:
         token = self._next_id
         self._next_id += 1
-        queue: asyncio.Queue[ParticipantFrameSnapshot] = asyncio.Queue(maxsize=1)
+        queue = _NewestAsyncQueue[ParticipantFrameSnapshot]()
         self._subscribers[token] = queue
         return token, queue
 
@@ -141,7 +193,7 @@ class ParticipantLivePreviewHub:
     """Newest-only JPEG fan-out with a hard queue depth of one per browser."""
 
     def __init__(self) -> None:
-        self._subscribers: dict[int, asyncio.Queue[ParticipantLivePreviewSnapshot]] = {}
+        self._subscribers: dict[int, _NewestAsyncQueue[ParticipantLivePreviewSnapshot]] = {}
         self._next_id = 0
 
     def publish(self, snapshot: ParticipantLivePreviewSnapshot) -> None:
@@ -156,7 +208,7 @@ class ParticipantLivePreviewHub:
     def subscribe(self) -> tuple[int, asyncio.Queue[ParticipantLivePreviewSnapshot]]:
         token = self._next_id
         self._next_id += 1
-        queue: asyncio.Queue[ParticipantLivePreviewSnapshot] = asyncio.Queue(maxsize=1)
+        queue = _NewestAsyncQueue[ParticipantLivePreviewSnapshot]()
         self._subscribers[token] = queue
         return token, queue
 

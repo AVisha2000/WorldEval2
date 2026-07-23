@@ -10,6 +10,7 @@ const TICKET := "0123456789abcdef0123456789abcdef0123456789a"
 const TASKS := [
 	"duo-checkpoint-race-v0", "duo-relay-control-v0", "duo-spar-v0",
 	"duo-resource-relay-v0",
+	"rts-skirmish-v0",
 ]
 
 var failures := PackedStringArray()
@@ -54,6 +55,7 @@ func _test_dispatch_and_participant_sources() -> void:
 			"movement-maze-v0", "operator-action-course-v0", "duo-checkpoint-race-v0",
 			"duo-relay-control-v0", "duo-spar-v0",
 			"duo-resource-relay-v0",
+			"rts-skirmish-v0",
 		], "v2 runtime capability list drifted")
 		for participant_id: String in ["participant_0", "participant_1"]:
 			var rival_id := "participant_1" if participant_id == "participant_0" else "participant_0"

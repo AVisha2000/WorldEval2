@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from genesis_arena.embodiment.contracts import ControllerState
 from genesis_arena.embodiment.duo_games.relay_control import (
     build_relay_control_demo_provider,
     evaluate_relay_control,
@@ -16,23 +17,27 @@ ROOT = Path(__file__).resolve().parents[2]
 PACKAGE = EmbodimentProtocolRegistry.from_repository(ROOT).package("llm-controller/0.2.0")
 
 
-def _observation(*, reverse: bool = False) -> dict[str, object]:
+def _observation(
+    *,
+    reverse: bool = False,
+    relay_state: str = "uncontrolled",
+) -> dict[str, object]:
     entities = [
         {
             "id": "v_relay_public",
             "kind": "relay",
-            "state": "contested",
+            "state": relay_state,
             "bearing": "front",
             "distance": "touching",
-            "affordances": ["control"],
+            "affordances": ["capture"],
         },
         {
             "id": "v_operator_public",
             "kind": "operator",
-            "state": "active",
+            "state": "ready",
             "bearing": "back_left",
             "distance": "far",
-            "affordances": ["hostile"],
+            "affordances": [],
         },
     ]
     if reverse:
@@ -81,6 +86,53 @@ async def test_relay_policy_is_repeatable_order_invariant_and_holds_ten_ticks() 
     assert action.control.duration_ticks == 10
     assert action.control.buttons.interact is True
     assert "v_relay_public" not in (outputs[0].raw_output or b"").decode("utf-8")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "relay_state",
+    ("uncontrolled", "self_holding", "rival_holding"),
+)
+async def test_relay_pressure_policy_accepts_every_authority_relay_state(
+    relay_state: str,
+) -> None:
+    provider = build_relay_control_demo_provider(
+        model="relay-controller-alpha-v1",
+        participant_id="participant_0",
+        seed=19,
+        decision_budget=1,
+    )
+
+    output = await provider.request(_request(_observation(relay_state=relay_state)))
+
+    action = parse_controller_action(output.raw_output or b"", package=PACKAGE)
+    assert action.control.buttons.interact is True
+
+
+@pytest.mark.asyncio
+async def test_relay_guard_policy_yields_before_entering_contested_space() -> None:
+    request = _request(_observation(relay_state="rival_holding"))
+    request = ProviderRequest(
+        episode_id=request.episode_id,
+        participant_id=request.participant_id,
+        observation_seq=request.observation_seq,
+        deadline_monotonic_ns=request.deadline_monotonic_ns,
+        model="relay-controller-bravo-v1",
+        system_prompt=request.system_prompt,
+        observation_json=request.observation_json,
+        action_schema_json=request.action_schema_json,
+    )
+    provider = build_relay_control_demo_provider(
+        model="relay-controller-bravo-v1",
+        participant_id="participant_0",
+        seed=19,
+        decision_budget=1,
+    )
+
+    output = await provider.request(request)
+
+    action = parse_controller_action(output.raw_output or b"", package=PACKAGE)
+    assert action.control == ControllerState.neutral(10)
 
 
 @pytest.mark.asyncio

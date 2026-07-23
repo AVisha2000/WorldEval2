@@ -150,26 +150,39 @@ class _Session:
 
     async def step(self, window):
         self.window = window
-        no_input_reason = window.decisions["participant_0"].no_input_reason
-        receipt = ActionReceipt(
-            action_id="no_input_participant_0_0",
-            observation_seq=0,
-            accepted=False,
-            start_tick=0,
-            end_tick=10,
-            applied_ticks=10,
-            codes=("no_input",),
-            disposition="no_input",
-            fallback="neutral",
-            no_input_reason=no_input_reason,
-        )
+        decision = window.decisions["participant_0"]
+        end_tick = window.start_tick + window.duration_ticks
+        if decision.disposition == "accepted":
+            assert decision.action is not None
+            receipt = ActionReceipt(
+                action_id=decision.action.action_id,
+                observation_seq=window.observation_seq,
+                accepted=True,
+                start_tick=window.start_tick,
+                end_tick=end_tick,
+                applied_ticks=window.duration_ticks,
+                codes=("accepted",),
+            )
+        else:
+            receipt = ActionReceipt(
+                action_id="no_input_participant_0_0",
+                observation_seq=window.observation_seq,
+                accepted=False,
+                start_tick=window.start_tick,
+                end_tick=end_tick,
+                applied_ticks=window.duration_ticks,
+                codes=("no_input",),
+                disposition="no_input",
+                fallback="neutral",
+                no_input_reason=decision.no_input_reason or "invalid",
+            )
         final_observation = (
-            _observation(self.episode_id, seq=1, tick=10, ended=True)
+            _observation(self.episode_id, seq=1, tick=end_tick, ended=True)
             if self._frames is None
             else _hybrid_observation(
                 self.episode_id,
                 seq=1,
-                tick=10,
+                tick=end_tick,
                 ended=True,
                 png=self._frames[1],
             )

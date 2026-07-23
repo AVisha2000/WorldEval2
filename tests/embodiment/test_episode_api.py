@@ -480,6 +480,31 @@ def test_demo_control_games_select_protocol_v2_without_credentials() -> None:
             }
         assert len(client.app.state.embodiment_episodes._credentials) == 0
 
+
+def test_fake_live_provider_selects_control_game_v2_and_keeps_legacy_v1() -> None:
+    # ``_app`` uses the local injected executor above: it consumes the in-memory credential but
+    # never constructs a network provider, so this covers live (non-Demo) protocol dispatch
+    # without making an external request.
+    with TestClient(_app()) as client:
+        for task_id in ("movement-maze-v0", "operator-action-course-v0"):
+            response = client.post(
+                "/api/embodiment/episodes",
+                json={**_payload(), "task_id": task_id},
+            )
+            assert response.status_code == 202
+            config = response.json()["config"]
+            assert config["provider"] == "openai"
+            assert config["run_class"] == "live"
+            assert config["protocol_version"] == "llm-controller/0.2.0"
+
+        legacy = client.post(
+            "/api/embodiment/episodes",
+            json={**_payload(), "task_id": "orientation-v0"},
+        )
+        assert legacy.status_code == 202
+        assert legacy.json()["config"]["protocol_version"] == "llm-controller/0.1.0"
+
+
 def test_demo_provider_rejects_keys_and_invalid_model_task_combinations() -> None:
     invalid_payloads = (
         {**_demo_payload(), "api_key": "must-not-be-consumed"},

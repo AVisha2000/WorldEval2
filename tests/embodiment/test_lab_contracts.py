@@ -130,6 +130,8 @@ def test_hash_only_bindings_are_safe_but_credential_like_values_are_not():
         assert_public_projection_safe({"label": "sk-proj-abcdefghijklmnopqrstuvwx"})
     with pytest.raises(LabContractError, match="credential-like"):
         assert_public_projection_safe({"label": "AIza" + "a" * 35})
+    with pytest.raises(LabContractError, match="credential-like"):
+        RunEntrant("entrant_0", "sk-proj-" + "a" * 24)
 
 
 def test_run_lifecycle_accepts_only_legal_transitions_and_terminal_evidence():

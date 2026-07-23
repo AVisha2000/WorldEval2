@@ -44,7 +44,14 @@ _BUILD_COSTS = {"barracks": {"wood": 2, "ore": 1}, "tower": {"wood": 1, "ore": 1
 _TASK_PLAN_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["protocol", "episode_id", "observation_seq", "intent_label", "memory_update", "assignments"],
+    "required": [
+        "protocol",
+        "episode_id",
+        "observation_seq",
+        "intent_label",
+        "memory_update",
+        "assignments",
+    ],
     "properties": {
         "protocol": {"const": PLAN_PROTOCOL},
         "episode_id": {"type": "string"},
@@ -57,8 +64,14 @@ _TASK_PLAN_SCHEMA = {
 _TASK_PLAN_SCHEMA_JSON = canonical_json_bytes(_TASK_PLAN_SCHEMA)
 _MEMORY_PREFIX = f"{PLAN_PROTOCOL}:"
 _NEUTRAL_BUTTONS = {
-    "interact": False, "primary": False, "guard": False, "dash": False,
-    "ability_1": False, "ability_2": False, "cycle_item": False, "cancel": False,
+    "interact": False,
+    "primary": False,
+    "guard": False,
+    "dash": False,
+    "ability_1": False,
+    "ability_2": False,
+    "cycle_item": False,
+    "cancel": False,
 }
 
 
@@ -96,6 +109,7 @@ class RtsTaskPlanProvider:
             return result
         try:
             raw_plan = strict_json_loads(result.raw_output)
+            raw_plan = _authority_plan_ids(raw_plan)
             validate_task_plan(
                 raw_plan,
                 episode_id=request.episode_id,
@@ -112,8 +126,12 @@ class RtsTaskPlanProvider:
                 "observation_seq": request.observation_seq,
                 "action_id": f"rts_v1_{request.participant_id}_{request.observation_seq}",
                 "control": {
-                    "move_x": 0, "move_y": 0, "look_x": 0, "look_y": 0,
-                    "duration_ticks": 10, "buttons": _NEUTRAL_BUTTONS,
+                    "move_x": 0,
+                    "move_y": 0,
+                    "look_x": 0,
+                    "look_y": 0,
+                    "duration_ticks": 10,
+                    "buttons": _NEUTRAL_BUTTONS,
                 },
                 "intent_label": str(raw_plan["intent_label"]),
                 "memory_update": memory_update,
@@ -136,11 +154,41 @@ def _task_memory(value: bytes) -> bytes:
         text = value.decode("utf-8")
         if not text.startswith(_MEMORY_PREFIX):
             return value
-        plan = strict_json_loads(text[len(_MEMORY_PREFIX):].encode("utf-8"))
+        plan = strict_json_loads(text[len(_MEMORY_PREFIX) :].encode("utf-8"))
         memory = plan.get("memory_update") if isinstance(plan, Mapping) else ""
         return memory.encode("utf-8") if isinstance(memory, str) else b""
     except (UnicodeDecodeError, ValueError):
         return b""
+
+
+def _authority_plan_ids(value: object) -> object:
+    """Translate only provider-visible semantic IDs back to stable authority IDs.
+
+    The model must choose from the IDs in its frozen-v2 observation, all of which begin with
+    ``v_``.  Godot task-plan evidence deliberately retains its older authority namespace.  This
+    boundary translation never accepts coordinates or an ID that the ordinary validator would
+    reject afterwards.
+    """
+
+    if not isinstance(value, Mapping):
+        return value
+    copied = dict(value)
+    assignments = copied.get("assignments")
+    if not isinstance(assignments, list):
+        return copied
+    translated: list[object] = []
+    for assignment in assignments:
+        if not isinstance(assignment, Mapping):
+            translated.append(assignment)
+            continue
+        item = dict(assignment)
+        for identifier_field in ("unit_id", "target_id"):
+            identifier = item.get(identifier_field)
+            if isinstance(identifier, str) and identifier.startswith("v_"):
+                item[identifier_field] = identifier.removeprefix("v_")
+        translated.append(item)
+    copied["assignments"] = translated
+    return copied
 
 
 def unit_ids(participant_id: str) -> tuple[str, str, str]:
@@ -150,7 +198,11 @@ def unit_ids(participant_id: str) -> tuple[str, str, str]:
 
 def visible_target_ids(participant_id: str) -> frozenset[str]:
     rival = "participant_1" if participant_id == "participant_0" else "participant_0"
-    resources = {f"{unit_ids(participant_id)[0].split('_')[0]}_{kind}_{index}" for kind, count in (("tree", 4), ("ore", 3)) for index in range(count)}
+    resources = {
+        f"{unit_ids(participant_id)[0].split('_')[0]}_{kind}_{index}"
+        for kind, count in (("tree", 4), ("ore", 3))
+        for index in range(count)
+    }
     return frozenset(
         {
             "town_hall",
@@ -206,11 +258,20 @@ def validate_task_plan(
             assignment.get("task"),
             assignment.get("target_id"),
         )
-        if not isinstance(unit_id, str) or unit_id not in owned or unit_id not in alive or unit_id in seen:
+        if (
+            not isinstance(unit_id, str)
+            or unit_id not in owned
+            or unit_id not in alive
+            or unit_id in seen
+        ):
             raise RtsV1PlanError("task_plan_unit_invalid")
         if not isinstance(task, str) or task not in TASKS:
             raise RtsV1PlanError("task_plan_task_invalid")
-        if not isinstance(target_id, str) or target_id not in visible or not _target_matches(participant_id, task, target_id):
+        if (
+            not isinstance(target_id, str)
+            or target_id not in visible
+            or not _target_matches(participant_id, task, target_id)
+        ):
             raise RtsV1PlanError("task_plan_target_invalid")
         seen.add(unit_id)
         validated.append({"unit_id": unit_id, "task": task, "target_id": target_id})
@@ -277,7 +338,11 @@ class RtsSkirmishV1Simulation:
     last_task_plans: dict[str, tuple[dict[str, object], ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.units = {unit_id: _Unit(unit_id, participant_id) for participant_id in PARTICIPANTS for unit_id in unit_ids(participant_id)}
+        self.units = {
+            unit_id: _Unit(unit_id, participant_id)
+            for participant_id in PARTICIPANTS
+            for unit_id in unit_ids(participant_id)
+        }
         self.economy = {participant_id: {"wood": 0, "ore": 0} for participant_id in PARTICIPANTS}
         self.structures = {
             participant_id: {
@@ -296,7 +361,9 @@ class RtsSkirmishV1Simulation:
             return
         accepted: dict[str, tuple[dict[str, object], ...]] = {}
         for participant_id in PARTICIPANTS:
-            alive = tuple(unit_id for unit_id in unit_ids(participant_id) if self.units[unit_id].alive)
+            alive = tuple(
+                unit_id for unit_id in unit_ids(participant_id) if self.units[unit_id].alive
+            )
             try:
                 accepted[participant_id] = validate_task_plan(
                     plans.get(participant_id),
@@ -311,7 +378,10 @@ class RtsSkirmishV1Simulation:
             else:
                 self.last_task_plans[participant_id] = accepted[participant_id]
                 for command in accepted[participant_id]:
-                    self.units[str(command["unit_id"])].order = (str(command["task"]), str(command["target_id"]))
+                    self.units[str(command["unit_id"])].order = (
+                        str(command["task"]),
+                        str(command["target_id"]),
+                    )
         for _ in range(duration_ticks):
             self._tick()
             if self.terminal["ended"]:
@@ -336,11 +406,18 @@ class RtsSkirmishV1Simulation:
                     unit.carrying = ""
                 elif task == "build":
                     cost = _BUILD_COSTS[target]
-                    if not self.structures[participant_id][target] and all(self.economy[participant_id][kind] >= amount for kind, amount in cost.items()):
+                    if not self.structures[participant_id][target] and all(
+                        self.economy[participant_id][kind] >= amount
+                        for kind, amount in cost.items()
+                    ):
                         for kind, amount in cost.items():
                             self.economy[participant_id][kind] -= amount
                         self.structures[participant_id][target] = True
-                elif task in {"train", "arm"} and self.structures[participant_id]["barracks"] and unit.role == "worker":
+                elif (
+                    task in {"train", "arm"}
+                    and self.structures[participant_id]["barracks"]
+                    and unit.role == "worker"
+                ):
                     unit.role = "militia"
                     self.trained[participant_id] += 1
                 elif task == "rally":
@@ -350,24 +427,41 @@ class RtsSkirmishV1Simulation:
                 elif task == "attack_unit" and unit.role == "militia" and self.units[target].alive:
                     pending_units[target] = pending_units.get(target, 0) + 35
                 elif task == "attack_structure" and unit.role == "militia":
-                    rival = "participant_1" if participant_id == "participant_0" else "participant_0"
+                    rival = (
+                        "participant_1" if participant_id == "participant_0" else "participant_0"
+                    )
                     structure = "town_hall" if target == "enemy_town_hall" else "tower_health"
-                    pending_structures[(rival, structure)] = pending_structures.get((rival, structure), 0) + 25
+                    pending_structures[(rival, structure)] = (
+                        pending_structures.get((rival, structure), 0) + 25
+                    )
         for unit_id, damage in pending_units.items():
             unit = self.units[unit_id]
             unit.health = max(0, unit.health - damage)
             unit.alive = unit.health > 0
         for (participant_id, structure), damage in pending_structures.items():
-            self.structures[participant_id][structure] = max(0, int(self.structures[participant_id][structure]) - damage)
+            self.structures[participant_id][structure] = max(
+                0, int(self.structures[participant_id][structure]) - damage
+            )
 
     def _resolve_terminal(self) -> None:
-        defeated = [participant_id for participant_id in PARTICIPANTS if int(self.structures[participant_id]["town_hall"]) == 0]
+        defeated = [
+            participant_id
+            for participant_id in PARTICIPANTS
+            if int(self.structures[participant_id]["town_hall"]) == 0
+        ]
         if len(defeated) == 1:
             self.winner_id = "participant_1" if defeated[0] == "participant_0" else "participant_0"
             self.terminal = {"ended": True, "outcome": "win", "reason": "town_hall_destroyed"}
         elif len(defeated) == 2:
-            self.terminal = {"ended": True, "outcome": "draw", "reason": "simultaneous_town_hall_destroyed"}
-        elif max(self.central_hold.values()) >= 60 and self.central_hold["participant_0"] != self.central_hold["participant_1"]:
+            self.terminal = {
+                "ended": True,
+                "outcome": "draw",
+                "reason": "simultaneous_town_hall_destroyed",
+            }
+        elif (
+            max(self.central_hold.values()) >= 60
+            and self.central_hold["participant_0"] != self.central_hold["participant_1"]
+        ):
             self.winner_id = max(self.central_hold, key=self.central_hold.get)
             self.terminal = {"ended": True, "outcome": "win", "reason": "central_objective"}
 
@@ -382,7 +476,9 @@ class RtsSkirmishV1Simulation:
                 "units_trained": self.trained[participant_id],
                 "central_hold_ticks": self.central_hold[participant_id],
                 "town_hall_health": int(self.structures[participant_id]["town_hall"]),
-                "living_units": sum(self.units[unit_id].alive for unit_id in unit_ids(participant_id)),
+                "living_units": sum(
+                    self.units[unit_id].alive for unit_id in unit_ids(participant_id)
+                ),
             }
         return {
             "task_id": TASK_ID,

@@ -13,6 +13,9 @@ from genesis_arena.embodiment.protocol_registry import EmbodimentProtocolRegistr
 from genesis_arena.embodiment.replay import ReplayLedger, ReplayValidationError, verify_replay_bytes
 
 ROOT = Path(__file__).resolve().parents[2]
+RTS_PROTOCOL_VERSION = "llm-controller/0.2.0"
+RTS_EPISODE_ID = "ep_rts_task_plan_fixture"
+RTS_PARTICIPANTS = ("participant_0", "participant_1")
 
 
 def _observation() -> dict:
@@ -99,17 +102,187 @@ def _reseal(value: dict) -> bytes:
     return canonical_json_bytes(value)
 
 
-def _rts_replay_with_task_plan_evidence() -> bytes:
-    """Make a schema-valid task-plan-evidence variant of the checked-in RTS replay.
+def _rts_observation(
+    *,
+    observation_seq: int,
+    tick: int,
+    previous_receipt: object,
+    terminal: dict,
+) -> dict:
+    return {
+        "protocol_version": RTS_PROTOCOL_VERSION,
+        "episode_id": RTS_EPISODE_ID,
+        "observation_seq": observation_seq,
+        "tick": tick,
+        "profile": "text-visible-v1",
+        "goal": "Exercise deterministic RTS task-plan replay validation.",
+        "remaining_ticks": 1200 - tick,
+        "self": {
+            "health_percent": 100,
+            "energy_percent": 100,
+            "facing": "east",
+            "contact": "clear",
+            "inventory": [],
+            "status": [],
+        },
+        "visible_entities": [],
+        "recent_events": [],
+        "previous_receipt": previous_receipt,
+        "memory": "",
+        "terminal": terminal,
+    }
 
-    The source replay is deliberately an older ordinary-controller ledger, so this fixture
-    changes only the generated receipt action IDs required by the new task executor audit.
-    It lets Python verify the extension without depending on a local Godot binary or /tmp.
+
+def _rts_action(participant_id: str, observation_seq: int) -> dict:
+    return {
+        "protocol_version": RTS_PROTOCOL_VERSION,
+        "episode_id": RTS_EPISODE_ID,
+        "observation_seq": observation_seq,
+        "action_id": f"fixture_{participant_id}_{observation_seq}",
+        "control": {
+            "move_x": 0,
+            "move_y": 0,
+            "look_x": 0,
+            "look_y": 0,
+            "duration_ticks": 10,
+            "buttons": {
+                "interact": False,
+                "primary": False,
+                "guard": False,
+                "dash": False,
+                "ability_1": False,
+                "ability_2": False,
+                "cycle_item": False,
+                "cancel": False,
+            },
+        },
+        "intent_label": "Deterministic RTS fixture action",
+        "memory_update": "",
+    }
+
+
+def _rts_receipt(action_id: str, observation_seq: int) -> dict:
+    start_tick = observation_seq * 10
+    return {
+        "action_id": action_id,
+        "observation_seq": observation_seq,
+        "accepted": True,
+        "disposition": "accepted",
+        "fallback": "none",
+        "no_input_reason": None,
+        "start_tick": start_tick,
+        "end_tick": start_tick + 10,
+        "applied_ticks": 10,
+        "codes": [],
+        "effects": [],
+    }
+
+
+def _rts_source_replay(registry: EmbodimentProtocolRegistry) -> bytes:
+    """Build a tiny ordinary-controller RTS replay without runs/ or live dependencies."""
+
+    package = registry.package(RTS_PROTOCOL_VERSION)
+    config = {
+        "protocol_version": RTS_PROTOCOL_VERSION,
+        "episode_id": RTS_EPISODE_ID,
+        "mode": "model-duel-v0",
+        "task_id": "rts-skirmish-v0",
+        "seed": 7,
+        "observation_profile": "text-visible-v1",
+        "timing_track": "step-locked-v1",
+        "maximum_episode_ticks": 1200,
+        "participant_ids": list(RTS_PARTICIPANTS),
+    }
+    initial_terminal = {"ended": False, "outcome": "running", "reason": "in_progress"}
+    ledger = ReplayLedger(
+        config=config,
+        config_sha256=canonical_sha256(config),
+        protocol_package_sha256=package.package_sha256,
+    )
+    ledger.record_initial(
+        observations={
+            participant_id: _rts_observation(
+                observation_seq=0,
+                tick=0,
+                previous_receipt=None,
+                terminal=initial_terminal,
+            )
+            for participant_id in RTS_PARTICIPANTS
+        },
+        state_hash="a" * 64,
+    )
+
+    final_terminal = initial_terminal
+    final_state_hash = "a" * 64
+    for observation_seq in range(2):
+        start_tick = observation_seq * 10
+        actions = {
+            participant_id: _rts_action(participant_id, observation_seq)
+            for participant_id in RTS_PARTICIPANTS
+        }
+        receipts = {
+            participant_id: _rts_receipt(
+                actions[participant_id]["action_id"], observation_seq
+            )
+            for participant_id in RTS_PARTICIPANTS
+        }
+        final_terminal = (
+            initial_terminal
+            if observation_seq == 0
+            else {"ended": True, "outcome": "win", "reason": "fixture_complete"}
+        )
+        final_state_hash = ("b" if observation_seq == 0 else "c") * 64
+        decision_window = {
+            "episode_id": RTS_EPISODE_ID,
+            "observation_seq": observation_seq,
+            "mode": "model-duel-v0",
+            "start_tick": start_tick,
+            "duration_ticks": 10,
+            "decisions": {
+                participant_id: {
+                    "disposition": "accepted",
+                    "action": actions[participant_id],
+                    "fallback": "none",
+                    "no_input_reason": None,
+                }
+                for participant_id in RTS_PARTICIPANTS
+            },
+        }
+        result = {
+            "observations": {
+                participant_id: _rts_observation(
+                    observation_seq=observation_seq + 1,
+                    tick=start_tick + 10,
+                    previous_receipt=receipts[participant_id],
+                    terminal=final_terminal,
+                )
+                for participant_id in RTS_PARTICIPANTS
+            },
+            "receipts": receipts,
+            "public_events": [],
+            "state_hash": final_state_hash,
+            "terminal": final_terminal,
+        }
+        ledger.record_step(decision_window=decision_window, result=result)
+
+    payload = ledger.seal(
+        final_terminal=final_terminal,
+        final_state_hash=final_state_hash,
+    )
+    verify_replay_bytes(payload, registry=registry)
+    return payload
+
+
+def _rts_replay_with_task_plan_evidence() -> bytes:
+    """Make a schema-valid task-plan-evidence variant of a deterministic RTS replay.
+
+    The generated source is deliberately an ordinary-controller ledger, so this fixture changes
+    only the receipt action IDs required by the task executor audit. It lets Python verify the
+    extension without a provider, Godot binary, ignored runs/ artifact, or temporary file.
     """
 
-    value = json.loads(
-        (ROOT / "runs/rts-skirmish-v0/rts-skirmish-cinematic-final.replay.json").read_bytes()
-    )
+    registry = EmbodimentProtocolRegistry.from_repository(ROOT)
+    value = json.loads(_rts_source_replay(registry))
     evidence: list[dict] = []
     for index, step in enumerate(value["steps"]):
         ordinary = step["decision_window"]
@@ -148,7 +321,7 @@ def _rts_replay_with_task_plan_evidence() -> bytes:
             }
             | {"plans": plans}
         )
-        for participant_id in ("participant_0", "participant_1"):
+        for participant_id in RTS_PARTICIPANTS:
             action_id = f"task_plan_{participant_id}_{index}"
             step["result"]["receipts"][participant_id]["action_id"] = action_id
             step["result"]["observations"][participant_id]["previous_receipt"][

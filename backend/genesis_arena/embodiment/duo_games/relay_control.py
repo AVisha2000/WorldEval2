@@ -4,11 +4,9 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from ..contracts import ControllerButtons, ControllerState
 from ..demo_provider import DemoPolicyLock, DemoProvider
 from ..providers.contracts import ProviderRequest
 from .common import (
-    FIXED_DUO_WINDOW_TICKS,
     DuoFixtureMode,
     DuoPolicySpec,
     build_demo_provider,
@@ -81,46 +79,23 @@ def _relay_control_behavior(
     ):
         raise ValueError("relay-control policy lock is incompatible")
     entities = parse_visible_observation(request)
-    hostile = select_visible_entity(
-        entities,
-        kinds=("operator",),
-        required_affordance="hostile",
-        states=frozenset(("active", "guarding", "attacking")),
-    )
     relay = select_visible_entity(
         entities,
         kinds=("relay",),
-        required_affordance="control",
-        states=frozenset(("neutral", "friendly", "hostile", "contested")),
+        required_affordance="capture",
+        states=frozenset(("uncontrolled", "self_holding", "rival_holding")),
     )
 
-    if hostile is not None and hostile["distance"] in {"touching", "near"}:
-        if hostile["bearing"] != "front":
-            control = move_or_turn_toward(hostile)
-            intent = "Demo: face the visible nearby rival"
-        elif spec.variant == "pressure":
-            control = ControllerState(
-                0,
-                250,
-                0,
-                0,
-                FIXED_DUO_WINDOW_TICKS,
-                ControllerButtons(primary=True),
-            )
-            intent = "Demo: pressure the visible nearby rival"
-        else:
-            control = ControllerState(
-                0,
-                0,
-                0,
-                0,
-                FIXED_DUO_WINDOW_TICKS,
-                ControllerButtons(guard=True),
-            )
-            intent = "Demo: guard against the visible nearby rival"
-    elif relay is None:
+    if relay is None:
         control = neutral_control()
         intent = "Demo: wait for a visible relay target"
+    elif spec.variant == "guard" and relay["state"] != "self_holding":
+        # The deterministic Demo matchup uses one pressure policy and one yielding guard
+        # policy.  Without that asymmetry both mirrored operators reach the relay on the
+        # same authority tick and contest it forever, which demonstrates no useful
+        # control behavior.  Seat rotation still gives each participant one pressure leg.
+        control = neutral_control()
+        intent = "Demo: hold outside the relay to avoid a contest"
     elif relay["bearing"] != "front":
         control = move_or_turn_toward(relay)
         intent = "Demo: face the visible relay"

@@ -1,5 +1,6 @@
 import { StrictMode } from "react"
 import { createRoot } from "react-dom/client"
+import { isPublicSharePath, publicGameIdFromPath } from "./lab/lab-routes"
 
 import "./index.css"
 
@@ -18,23 +19,28 @@ async function bootstrap() {
     return
   }
 
-  const [
-    { default: App },
-    { QueryClient, QueryClientProvider },
-    { ThemeProvider },
-  ] = await Promise.all([
-    import("./App.tsx"),
-    import("@tanstack/react-query"),
-    import("@/components/theme-provider.tsx"),
-  ])
-  const queryClient = new QueryClient()
-  document.title = "WorldArena Controller Lab"
+  const [{ LabApp, PublicLabApp, PublicShareLanding }, { ThemeProvider }] =
+    await Promise.all([
+      import("./lab/LabApp.tsx"),
+      import("@/components/theme-provider.tsx"),
+    ])
+  const publicGameId = publicGameIdFromPath()
+  const publicShare = isPublicSharePath()
+  document.title = publicGameId
+    ? "WorldEval — Game guide"
+    : publicShare
+      ? "WorldEval — Public game guides"
+      : "WorldEval Lab"
   root.render(
     <StrictMode>
       <ThemeProvider defaultTheme="dark">
-        <QueryClientProvider client={queryClient}>
-          <App />
-        </QueryClientProvider>
+        {publicGameId ? (
+          <PublicLabApp gameId={publicGameId} />
+        ) : publicShare ? (
+          <PublicShareLanding />
+        ) : (
+          <LabApp />
+        )}
       </ThemeProvider>
     </StrictMode>
   )

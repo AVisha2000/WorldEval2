@@ -111,42 +111,11 @@ const Vignette = ({strength = 0.78}: {strength?: number}) => (
   />
 );
 
-const Step = ({
-  label,
-  detail,
-  color,
-  frame,
-  delay,
-}: {
-  label: string;
-  detail: string;
-  color: string;
-  frame: number;
-  delay: number;
-}) => (
-  <div
-    style={{
-      flex: 1,
-      minHeight: 218,
-      borderRadius: 24,
-      border: `1px solid ${color}77`,
-      background: colors.panelStrong,
-      padding: '28px 26px',
-      boxShadow: '0 22px 70px rgba(0,0,0,0.35)',
-      opacity: reveal(frame, delay),
-      translate: `0 ${rise(frame, delay)}px`,
-    }}
-  >
-    <div style={{color, fontSize: 18, fontWeight: 900, letterSpacing: 2.4}}>{label}</div>
-    <div style={{marginTop: 23, color: colors.text, fontSize: 28, lineHeight: 1.27, fontWeight: 800}}>{detail}</div>
-  </div>
-);
-
-const Arrow = ({frame, delay}: {frame: number; delay: number}) => (
+const Arrow = ({frame, delay, color = colors.muted}: {frame: number; delay: number; color?: string}) => (
   <div
     style={{
       alignSelf: 'center',
-      color: colors.muted,
+      color,
       fontSize: 40,
       fontWeight: 700,
       opacity: reveal(frame, delay),
@@ -155,6 +124,58 @@ const Arrow = ({frame, delay}: {frame: number; delay: number}) => (
     →
   </div>
 );
+
+const AgentRunVisual = () => {
+  const frame = useCurrentFrame();
+  const pathProgress = reveal(frame, 110, 86);
+  const robotX = interpolate(pathProgress, [0, 1], [0, 428]);
+  const robotY = interpolate(pathProgress, [0, 0.48, 1], [0, -56, 8]);
+  const bubbleOpacity = reveal(frame, 50);
+
+  return (
+    <div
+      style={{
+        position: 'relative',
+        height: 370,
+        borderRadius: 28,
+        overflow: 'hidden',
+        border: `1px solid ${colors.cyan}55`,
+        background: 'linear-gradient(135deg, rgba(7,28,36,0.98), rgba(4,14,20,0.96))',
+        boxShadow: '0 24px 80px rgba(0,0,0,0.34)',
+        opacity: reveal(frame, 48),
+        translate: `0 ${rise(frame, 48, 26)}px`,
+      }}
+    >
+      <div style={{position: 'absolute', inset: 0, backgroundImage: 'linear-gradient(rgba(84,217,232,0.06) 1px, transparent 1px), linear-gradient(90deg, rgba(84,217,232,0.06) 1px, transparent 1px)', backgroundSize: '36px 36px'}} />
+      <div style={{position: 'absolute', top: 25, left: 30, color: colors.cyan, fontSize: 16, fontWeight: 900, letterSpacing: 2.4}}>ONE OBSERVABLE RUN</div>
+      <div style={{position: 'absolute', top: 69, left: 31, color: colors.muted, fontSize: 18, fontWeight: 700}}>Observation</div>
+      <div style={{position: 'absolute', top: 96, left: 31, width: 194, borderRadius: 15, padding: '14px 15px', background: 'rgba(2,8,12,0.72)', border: `1px solid ${colors.cyan}55`, color: colors.text, fontSize: 17, lineHeight: 1.35}}>
+        Exit is north-east. Bridge is clear.
+      </div>
+      <div style={{position: 'absolute', left: 216, top: 141, opacity: bubbleOpacity, translate: `0 ${rise(frame, 50, 18)}px`}}>
+        <div style={{position: 'relative', borderRadius: 15, padding: '13px 17px', background: colors.amber, color: colors.ink, fontSize: 18, fontWeight: 900, boxShadow: `0 12px 34px ${colors.amber}33`}}>
+          Move toward the exit.
+          <div style={{position: 'absolute', bottom: -9, left: 30, width: 18, height: 18, background: colors.amber, rotate: '45deg'}} />
+        </div>
+      </div>
+      <div style={{position: 'absolute', left: 250, right: 56, bottom: 99, height: 3, background: 'rgba(101,230,190,0.2)', borderRadius: 99}}>
+        <div style={{height: '100%', width: `${pathProgress * 100}%`, background: colors.mint, borderRadius: 99, boxShadow: `0 0 20px ${colors.mint}`}} />
+      </div>
+      <div style={{position: 'absolute', left: 250 + robotX, bottom: 74 - robotY, width: 50, height: 50, borderRadius: 16, background: colors.ink, border: `3px solid ${colors.amber}`, boxShadow: `0 0 25px ${colors.amber}66`}}>
+        <div style={{position: 'absolute', left: 10, top: 16, width: 8, height: 8, borderRadius: '50%', background: colors.cyan}} />
+        <div style={{position: 'absolute', right: 10, top: 16, width: 8, height: 8, borderRadius: '50%', background: colors.cyan}} />
+        <div style={{position: 'absolute', top: -13, left: 21, width: 3, height: 11, background: colors.amber}} />
+        <div style={{position: 'absolute', top: -17, left: 18, width: 9, height: 9, borderRadius: '50%', background: colors.amber}} />
+      </div>
+      <div style={{position: 'absolute', right: 36, bottom: 58, width: 88, height: 88, borderRadius: 22, border: `2px solid ${colors.mint}`, display: 'flex', alignItems: 'center', justifyContent: 'center', color: colors.mint, fontSize: 16, fontWeight: 900, textAlign: 'center', lineHeight: 1.1, opacity: reveal(frame, 178)}}>WORLD<br />EVENT</div>
+      <div style={{position: 'absolute', left: 30, bottom: 24, display: 'flex', gap: 10, opacity: reveal(frame, 202)}}>
+        {['SAW', 'ACTED', 'RESULT'].map((item, index) => (
+          <div key={item} style={{borderRadius: 999, padding: '9px 13px', border: `1px solid ${[colors.cyan, colors.amber, colors.mint][index]}77`, color: [colors.cyan, colors.amber, colors.mint][index], fontSize: 14, fontWeight: 900, letterSpacing: 1.2}}>{item}</div>
+        ))}
+      </div>
+    </div>
+  );
+};
 
 const HookSlide = ({duration}: {duration: number}) => {
   const frame = useCurrentFrame();
@@ -232,11 +253,6 @@ const HookSlide = ({duration}: {duration: number}) => {
 
 const BehaviourSlide = ({duration}: {duration: number}) => {
   const frame = useCurrentFrame();
-  const steps = [
-    ['WHAT IT SAW', 'participant-visible observation', colors.cyan],
-    ['WHAT IT DID', 'controller action', colors.amber],
-    ['WHAT HAPPENED', 'world event + result', colors.mint],
-  ] as const;
   const metrics = ['FINISH', 'RECOVER', 'USE RESOURCES', 'FOLLOW RULES'];
 
   return (
@@ -256,22 +272,29 @@ const BehaviourSlide = ({duration}: {duration: number}) => {
       <AbsoluteFill style={{background: 'linear-gradient(115deg, rgba(3,8,12,0.97), rgba(3,8,12,0.76))'}} />
       <Brand section="LLM BEHAVIOURAL EVALS" slide="02 / 04" />
       <div style={{position: 'absolute', zIndex: 20, left: 76, right: 76, top: 160}}>
-        <div style={{fontSize: 74, lineHeight: 1.03, fontWeight: 900, letterSpacing: -3, opacity: reveal(frame, 22)}}>
+        <div style={{fontSize: 74, lineHeight: 1.03, fontWeight: 900, letterSpacing: -3, opacity: reveal(frame, 18)}}>
           The benchmark is the <span style={{color: colors.amber}}>whole run.</span>
         </div>
-        <div style={{display: 'flex', alignItems: 'stretch', gap: 17, marginTop: 62}}>
-          {steps.map(([label, detail, color], index) => (
-            <>
-              <Step key={label} label={label} detail={detail} color={color} frame={frame} delay={66 + index * 34} />
-              {index < steps.length - 1 ? <Arrow key={`${label}-arrow`} frame={frame} delay={88 + index * 34} /> : null}
-            </>
-          ))}
+        <div style={{display: 'grid', gridTemplateColumns: '1fr 0.82fr', gap: 28, marginTop: 46, alignItems: 'stretch'}}>
+          <AgentRunVisual />
+          <div style={{display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 16}}>
+            {[
+              ['WHAT IT SAW', 'participant-visible observation', colors.cyan],
+              ['WHAT IT DID', 'controller action', colors.amber],
+              ['WHAT HAPPENED', 'world event + result', colors.mint],
+            ].map(([label, detail, color], index) => (
+              <div key={label} style={{borderRadius: 20, padding: '19px 22px', border: `1px solid ${color}77`, background: colors.panelStrong, opacity: reveal(frame, 74 + index * 35), translate: `0 ${rise(frame, 74 + index * 35, 22)}px`}}>
+                <div style={{color, fontSize: 16, fontWeight: 900, letterSpacing: 2}}>{label}</div>
+                <div style={{marginTop: 10, color: colors.text, fontSize: 23, lineHeight: 1.2, fontWeight: 800}}>{detail}</div>
+              </div>
+            ))}
+          </div>
         </div>
         <div
           style={{
             display: 'flex',
             gap: 13,
-            marginTop: 42,
+            marginTop: 30,
             justifyContent: 'center',
             opacity: reveal(frame, 182),
           }}
@@ -498,7 +521,7 @@ const FrontierSlide = () => {
           NOW, OPEN THE LIVE LAB&nbsp;&nbsp;→
         </div>
       </div>
-      <div style={{position: 'absolute', zIndex: 15, right: 52, top: 150, opacity: reveal(frame, 22), scale: interpolate(frame, [22, 150], [0.94, 1], {extrapolateRight: 'clamp', easing: ease})}}>
+      <div style={{position: 'absolute', zIndex: 15, right: 52, top: 150, opacity: reveal(frame, 22)}}>
         <CapabilityOrbit />
       </div>
       <WipeIn accent={colors.mint} />

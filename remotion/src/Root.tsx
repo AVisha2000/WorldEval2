@@ -9,6 +9,10 @@ import {
   WORLD_EVAL_HACKATHON_OPENER_DURATION,
   WorldEvalHackathonOpener,
 } from './WorldEvalHackathonOpener';
+import {
+  WORLD_EVAL_CODEX_OUTRO_DURATION,
+  WorldEvalCodexOutro,
+} from './WorldEvalCodexOutro';
 
 const defaultIntroProps: WorldArenaIntroProps = {
   title: 'WORLD ARENA',
@@ -48,6 +52,14 @@ export const RemotionRoot = () => {
       id="WorldEvalHackathonOpener"
       component={WorldEvalHackathonOpener}
       durationInFrames={WORLD_EVAL_HACKATHON_OPENER_DURATION}
+      fps={30}
+      width={1920}
+      height={1080}
+    />
+    <Composition
+      id="WorldEvalCodexOutro"
+      component={WorldEvalCodexOutro}
+      durationInFrames={WORLD_EVAL_CODEX_OUTRO_DURATION}
       fps={30}
       width={1920}
       height={1080}

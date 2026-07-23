@@ -8,6 +8,7 @@ from typing import Any, Mapping
 from fastapi import (
     APIRouter,
     Body,
+    Depends,
     HTTPException,
     Query,
     Request,
@@ -17,6 +18,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 
+from ..lab_auth_api import create_lab_operator_requirement
 from .credentials import SessionCredential
 from .crossroads_conquest import CachedCrossroadsShowcase
 from .demo_scenarios import demo_scenario
@@ -100,6 +102,18 @@ def _live_labyrinth_service(request: Request) -> LiveLabyrinthService:
     if not isinstance(service, LiveLabyrinthService):
         raise RuntimeError("Live labyrinth service is not configured")
     return service
+
+
+def _lab_auth_service(request: Request):
+    """Resolve the app-owned Lab auth service without importing the application singleton."""
+
+    return getattr(request.app.state, "lab_auth", None)
+
+
+# These older compatibility routes share the same authority as `/api/lab`. They remain available
+# to authenticated Lab operators, but must not be an unauthenticated bearer-capability bypass for
+# live state, replay, video, or cancellation.
+_require_live_maze_operator = create_lab_operator_requirement(_lab_auth_service)
 
 
 def _readiness(request: Request) -> PilotReadinessStore:
@@ -259,7 +273,10 @@ async def create_episode(
 
 @router.post("/api/embodiment/maze-races", status_code=202)
 async def create_live_maze_race(
-    request: Request, response: Response, payload: Any = _BODY
+    request: Request,
+    response: Response,
+    payload: Any = _BODY,
+    _operator: object = Depends(_require_live_maze_operator),
 ) -> Mapping[str, object]:
     """Start an isolated, concurrent three-controller live maze race."""
     try:
@@ -295,7 +312,11 @@ async def create_live_maze_race(
 
 
 @router.get("/api/embodiment/maze-races/{episode_id}")
-async def get_live_maze_race(request: Request, episode_id: str) -> Mapping[str, object]:
+async def get_live_maze_race(
+    request: Request,
+    episode_id: str,
+    _operator: object = Depends(_require_live_maze_operator),
+) -> Mapping[str, object]:
     try:
         return await _live_labyrinth_service(request).status(episode_id)
     except LiveLabyrinthNotFoundError:
@@ -303,7 +324,11 @@ async def get_live_maze_race(request: Request, episode_id: str) -> Mapping[str, 
 
 
 @router.get("/api/embodiment/maze-races/{episode_id}/video")
-async def get_live_maze_video(request: Request, episode_id: str) -> Response:
+async def get_live_maze_video(
+    request: Request,
+    episode_id: str,
+    _operator: object = Depends(_require_live_maze_operator),
+) -> Response:
     try:
         path = await _live_labyrinth_service(request).video_path(episode_id)
     except LiveLabyrinthNotFoundError:
@@ -323,7 +348,10 @@ async def get_live_maze_video(request: Request, episode_id: str) -> Response:
 
 @router.get("/api/embodiment/maze-races/{episode_id}/{projection}")
 async def get_live_maze_projection(
-    request: Request, episode_id: str, projection: str
+    request: Request,
+    episode_id: str,
+    projection: str,
+    _operator: object = Depends(_require_live_maze_operator),
 ) -> Mapping[str, object]:
     if projection not in {"result", "evaluation", "replay"}:
         raise HTTPException(status_code=404, detail={"code": "live_maze_projection_not_found"})
@@ -336,7 +364,11 @@ async def get_live_maze_projection(
 
 
 @router.post("/api/embodiment/maze-races/{episode_id}/cancel")
-async def cancel_live_maze_race(request: Request, episode_id: str) -> Mapping[str, object]:
+async def cancel_live_maze_race(
+    request: Request,
+    episode_id: str,
+    _operator: object = Depends(_require_live_maze_operator),
+) -> Mapping[str, object]:
     try:
         return await _live_labyrinth_service(request).cancel(episode_id)
     except LiveLabyrinthNotFoundError:

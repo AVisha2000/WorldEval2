@@ -12,6 +12,8 @@ from genesis_arena.embodiment.labyrinth_run import HEADINGS, _cell_graph, _start
 from genesis_arena.embodiment.live_labyrinth import (
     LIVE_TASK_ID,
     MAX_LIVE_PROVIDER_CALLS,
+    MAX_LIVE_SPECTATOR_FRAMES,
+    MAX_LIVE_SPECTATOR_PATH_CELLS,
     LiveLabyrinthError,
     LiveLabyrinthService,
     LiveMazeEntrant,
@@ -187,6 +189,36 @@ def test_navigation_memory_tracks_local_pose_branches_and_failed_turns() -> None
     memory.close()
 
 
+def test_navigation_memory_recovers_when_a_model_declines_loop_backtrack() -> None:
+    """A legal move away from a loop hint must not retain a non-adjacent parent."""
+
+    memory = MazeNavigationMemory("participant_0")
+    memory.observe(observation_seq=0, visible_passages=("forward",), landmark="none")
+    # Walk a four-cell loop back to the origin.  Returning to the already-traversed
+    # origin creates a temporary recovery hint to the preceding cell.
+    for choice in ("forward", "right", "right", "right"):
+        memory.apply_transition(choice, "moved")
+    loop_snapshot = memory.observe(
+        observation_seq=1,
+        visible_passages=("forward", "back"),
+        landmark="none",
+    )
+    assert loop_snapshot["current"]["backtrack"] == "back"
+
+    # The controller is permitted to choose another legal passage.  The old loop hint
+    # must be discarded rather than becoming a non-adjacent backtrack parent.
+    memory.apply_transition("forward", "moved")
+    recovered = memory.observe(
+        observation_seq=2,
+        visible_passages=("back",),
+        landmark="none",
+    )
+    assert recovered["pose"] == [-1, 0, "W"]
+    assert recovered["current"]["backtrack"] == "back"
+    assert len(memory.utf8) <= 2048
+    memory.close()
+
+
 def test_configurable_straight_line_vision_stops_at_walls_and_never_turns_corners() -> None:
     start = _start_exit()[0]
     assert maze_visible_cells(start, 1) == ((7, 13), (8, 13))
@@ -327,9 +359,7 @@ async def test_live_race_runs_three_private_provider_calls_and_seals_public_repl
         leaked = copy.deepcopy(execution.replay)
         leaked[protected_key] = "must not publish"
         leaked.pop("final_state_sha256")
-        leaked["final_state_sha256"] = hashlib.sha256(
-            canonical_json_bytes(leaked)
-        ).hexdigest()
+        leaked["final_state_sha256"] = hashlib.sha256(canonical_json_bytes(leaked)).hexdigest()
         with pytest.raises(LiveLabyrinthError, match="protected controller material"):
             verify_live_replay(leaked)
 
@@ -365,9 +395,7 @@ async def test_live_race_runs_three_private_provider_calls_and_seals_public_repl
 
     for tampered in tampered_replays:
         tampered.pop("final_state_sha256")
-        tampered["final_state_sha256"] = hashlib.sha256(
-            canonical_json_bytes(tampered)
-        ).hexdigest()
+        tampered["final_state_sha256"] = hashlib.sha256(canonical_json_bytes(tampered)).hexdigest()
         with pytest.raises(LiveLabyrinthError):
             verify_live_replay(tampered)
 
@@ -441,6 +469,95 @@ async def test_service_reports_a_safe_credential_failure_instead_of_a_tick_zero_
         await asyncio.sleep(0)
     assert status["state"] == "failed"
     assert status["failure"] == "live_provider_credential_rejected"
+
+
+@pytest.mark.asyncio
+async def test_service_exposes_only_a_safe_authority_observer_frame() -> None:
+    choices = _shortest_choices()
+    service = LiveLabyrinthService()
+    created = await service.create(
+        entrants=_entrants(),
+        providers={
+            participant_id: ScriptedMazeProvider(choices)
+            for participant_id in ("participant_0", "participant_1", "participant_2")
+        },
+        max_provider_calls=180,
+    )
+    episode_id = str(created["episode_id"])
+    initial = await service.observer(episode_id)
+    assert initial is not None
+    assert initial["tick"] == 0
+    assert initial["map"]["rows"]
+    assert initial["racers"][0]["path"] == [initial["map"]["start"]]
+    assert "model" not in initial["racers"][0]
+    assert "provider" not in initial["racers"][0]
+    initial_feed = await service.spectator_frames(episode_id)
+    assert initial_feed["cursor"] >= 1
+    assert initial_feed["reset_required"] is False
+    assert initial_feed["frames"]
+    assert initial_feed["frames"][0]["sequence"] == 1
+    assert initial_feed["frames"][0]["frame"]["tick"] == 0
+
+    for _ in range(200):
+        status = await service.status(episode_id)
+        if status["state"] not in {"queued", "running"}:
+            break
+        await asyncio.sleep(0)
+    latest = await service.observer(episode_id)
+    assert latest is not None
+    assert latest["provider_calls"] > 0
+    assert status["observer"] == {"available": True, "tick": latest["tick"]}
+    rendered = canonical_json_bytes(latest).decode("utf-8").casefold()
+    for protected in ("navigation_memory", "scratchpad", "raw_output", "prompt"):
+        assert protected not in rendered
+    terminal_feed = await service.spectator_frames(episode_id, after_sequence=0)
+    assert terminal_feed["cursor"] == terminal_feed["frames"][-1]["sequence"]
+    assert terminal_feed["frames"][-1]["frame"] == latest
+    assert all(
+        len(racer["path"]) <= MAX_LIVE_SPECTATOR_PATH_CELLS
+        for item in terminal_feed["frames"]
+        for racer in item["frame"]["racers"]
+    )
+    terminal_rendered = canonical_json_bytes(terminal_feed).decode("utf-8").casefold()
+    for protected in (
+        "episode_id",
+        "navigation_memory",
+        "scratchpad",
+        "raw_output",
+        "prompt",
+    ):
+        assert protected not in terminal_rendered
+    assert '"model"' not in terminal_rendered
+    assert '"provider"' not in terminal_rendered
+
+
+@pytest.mark.asyncio
+async def test_service_spectator_cursor_resets_after_bounded_frame_overflow() -> None:
+    service = LiveLabyrinthService()
+    created = await service.create(
+        entrants=_entrants(),
+        providers={
+            participant_id: ScriptedMazeProvider(["wait"] * (MAX_LIVE_SPECTATOR_FRAMES + 2))
+            for participant_id in ("participant_0", "participant_1", "participant_2")
+        },
+        max_provider_calls=MAX_LIVE_SPECTATOR_FRAMES + 1,
+    )
+    episode_id = str(created["episode_id"])
+    for _ in range(MAX_LIVE_SPECTATOR_FRAMES * 4):
+        status = await service.status(episode_id)
+        if status["state"] not in {"queued", "running"}:
+            break
+        await asyncio.sleep(0)
+    assert status["state"] == "completed"
+
+    overflowed = await service.spectator_frames(episode_id, after_sequence=0)
+    assert overflowed["reset_required"] is True
+    assert len(overflowed["frames"]) == 1
+    assert overflowed["frames"][0]["sequence"] == overflowed["cursor"]
+    overflowed["frames"][0]["frame"]["map"]["rows"][0] = "tampered"
+
+    fresh = await service.spectator_frames(episode_id, after_sequence=0)
+    assert fresh["frames"][0]["frame"]["map"]["rows"][0] != "tampered"
 
 
 def test_verifier_rejects_public_protected_material() -> None:

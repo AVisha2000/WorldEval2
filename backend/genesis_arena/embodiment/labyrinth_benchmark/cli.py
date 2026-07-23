@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from .analysis import analyze_store, flatten_results, select_best_vision_depth
-from .artifacts import BenchmarkArtifactStore, export_curated_report
+from .artifacts import BenchmarkArtifactStore, atomic_write_json, export_curated_report
 from .report import generate_report
 from .runner import (
     OpenAILabyrinthBenchmarkExecutor,
@@ -21,6 +21,7 @@ from .runner import (
     validate_pilot_gate,
 )
 from .spec import (
+    ScheduledRace,
     build_benchmark_spec,
     build_schedule,
     generate_map_suite,
@@ -73,7 +74,27 @@ async def _live_executor(store: BenchmarkArtifactStore) -> OpenAILabyrinthBenchm
     api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is required in the local process environment")
-    return OpenAILabyrinthBenchmarkExecutor(api_key, store.load_specification())
+
+    def write_live_snapshot(race: ScheduledRace, snapshot: Mapping[str, object]) -> None:
+        # This volatile observer feed is deliberately not part of the curated benchmark export.
+        # It contains only public maze geometry and movement state, never model/controller data.
+        atomic_write_json(
+            store.root / "live.json",
+            {
+                "schema_version": "worldarena/labyrinth-benchmark-live/1",
+                "season_id": store.season_id,
+                "phase": race.phase,
+                "race_id": race.race_id,
+                "map_id": race.map_id,
+                "map_sha256": race.map_sha256,
+                "vision_depth": race.vision_depth,
+                "snapshot": snapshot,
+            },
+        )
+
+    return OpenAILabyrinthBenchmarkExecutor(
+        api_key, store.load_specification(), public_observer=write_live_snapshot
+    )
 
 
 async def _pilot(store: BenchmarkArtifactStore) -> None:

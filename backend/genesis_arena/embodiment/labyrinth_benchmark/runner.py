@@ -90,7 +90,13 @@ def acknowledge_terminal_stop(store: BenchmarkArtifactStore) -> Mapping[str, obj
 class OpenAILabyrinthBenchmarkExecutor:
     """Process-local OpenAI executor; its credential is never represented in artifacts."""
 
-    def __init__(self, api_key: str, spec: LabyrinthBenchmarkSpec) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        spec: LabyrinthBenchmarkSpec,
+        *,
+        public_observer: Callable[[ScheduledRace, Mapping[str, object]], None] | None = None,
+    ) -> None:
         if not isinstance(api_key, str) or not api_key:
             raise BenchmarkRunError("OPENAI_API_KEY is required")
         if not isinstance(spec, LabyrinthBenchmarkSpec):
@@ -104,11 +110,10 @@ class OpenAILabyrinthBenchmarkExecutor:
         self._models = {item.model_id: item for item in spec.models}
         self._skill_text = skill_text
         self._providers = {
-            participant_id: OpenAIProviderAdapter(
-                api_key=api_key, service_tier=spec.service_tier
-            )
+            participant_id: OpenAIProviderAdapter(api_key=api_key, service_tier=spec.service_tier)
             for participant_id in PARTICIPANTS
         }
+        self._public_observer = public_observer
         self._closed = False
 
     def _verify_frozen_inputs(self) -> None:
@@ -149,9 +154,12 @@ class OpenAILabyrinthBenchmarkExecutor:
                 participant_call_budget=race.participant_call_budget,
                 vision_range_cells=race.vision_depth,
                 skill_text=(
-                    self._skill_text
-                    if race.skill_mode == MAZE_NAVIGATION_SKILL_ID
-                    else None
+                    self._skill_text if race.skill_mode == MAZE_NAVIGATION_SKILL_ID else None
+                ),
+                public_observer=(
+                    None
+                    if self._public_observer is None
+                    else lambda snapshot: self._public_observer(race, snapshot)
                 ),
             )
             wall_time_ms = max(0, time.monotonic_ns() - started) // 1_000_000
@@ -215,14 +223,10 @@ def safe_race_result(
         calls = len(decisions)
         completed = racer.get("finished") is True
         input_tokens = sum(
-            item.telemetry.input_tokens or 0
-            for item in decisions
-            if item.telemetry is not None
+            item.telemetry.input_tokens or 0 for item in decisions if item.telemetry is not None
         )
         output_tokens = sum(
-            item.telemetry.output_tokens or 0
-            for item in decisions
-            if item.telemetry is not None
+            item.telemetry.output_tokens or 0 for item in decisions if item.telemetry is not None
         )
         cached_input_tokens = sum(
             item.telemetry.cached_input_tokens or 0
@@ -235,9 +239,7 @@ def safe_race_result(
             if item.telemetry is not None
         )
         latency_ms = sum(
-            item.telemetry.latency_ms
-            for item in decisions
-            if item.telemetry is not None
+            item.telemetry.latency_ms for item in decisions if item.telemetry is not None
         )
         tokens_complete = bool(decisions) and all(
             item.telemetry is not None
@@ -288,9 +290,7 @@ def safe_race_result(
                 "path_efficiency_basis_points": (
                     0
                     if not completed or distance_cells == 0
-                    else int(racer.get("shortest_path_cells", 0))
-                    * 10_000
-                    // distance_cells
+                    else int(racer.get("shortest_path_cells", 0)) * 10_000 // distance_cells
                 ),
                 "unique_corridor_cells": int(racer.get("unique_corridor_cells", 0)),
                 "repeated_corridor_cells": repeated_cells,
@@ -302,9 +302,7 @@ def safe_race_result(
                     0 if calls == 0 else invalid_decisions * 10_000 // calls
                 ),
                 "waiting_windows": waiting_windows,
-                "wait_basis_points": (
-                    0 if calls == 0 else waiting_windows * 10_000 // calls
-                ),
+                "wait_basis_points": (0 if calls == 0 else waiting_windows * 10_000 // calls),
                 "corridor_commands": corridor_commands,
                 "single_cell_commands": single_cell_commands,
                 "corridor_command_basis_points": (
@@ -372,9 +370,7 @@ def safe_race_result(
     }
 
 
-def opaque_episode_id(
-    spec: LabyrinthBenchmarkSpec, race: ScheduledRace, *, attempt: int
-) -> str:
+def opaque_episode_id(spec: LabyrinthBenchmarkSpec, race: ScheduledRace, *, attempt: int) -> str:
     """Bind a call to its frozen cell without exposing map or condition labels to the model."""
 
     if attempt not in {1, 2}:
@@ -491,9 +487,7 @@ async def run_schedule(
             if maze is None or maze.map_sha256 != race.map_sha256:
                 raise BenchmarkRunError("scheduled maze is unavailable")
             pending_retry = state.get("pending_retry")
-            if isinstance(pending_retry, Mapping) and pending_retry.get(
-                "race_id"
-            ) == race.race_id:
+            if isinstance(pending_retry, Mapping) and pending_retry.get("race_id") == race.race_id:
                 if pending_retry.get("retry_started") is True:
                     state.update(
                         {
@@ -549,9 +543,7 @@ async def run_schedule(
                         }
                         store.write_state(state)
                         continue
-                    raise BenchmarkRunError(
-                        "benchmark_repeated_infrastructure_outage"
-                    ) from abort
+                    raise BenchmarkRunError("benchmark_repeated_infrastructure_outage") from abort
                 result = _bind_executor_result(
                     raw_result, season_id=store.season_id, schedule=schedule
                 )
@@ -662,20 +654,12 @@ def build_pilot_projection(store: BenchmarkArtifactStore) -> Mapping[str, object
     results = store.iter_results("pilot")
     pilot_races = len(results)
     remaining_races = 600 + 120
-    pilot_calls = sum(
-        int(episode["calls"])
-        for result in results
-        for episode in result["episodes"]
-    )
+    pilot_calls = sum(int(episode["calls"]) for result in results for episode in result["episodes"])
     pilot_input_tokens = sum(
-        int(episode["input_tokens"])
-        for result in results
-        for episode in result["episodes"]
+        int(episode["input_tokens"]) for result in results for episode in result["episodes"]
     )
     pilot_output_tokens = sum(
-        int(episode["output_tokens"])
-        for result in results
-        for episode in result["episodes"]
+        int(episode["output_tokens"]) for result in results for episode in result["episodes"]
     )
     pilot_elapsed_ms = sum(int(result["wall_time_ms"]) for result in results)
     episodes = [episode for result in results for episode in result["episodes"]]
@@ -769,9 +753,7 @@ def build_pilot_projection(store: BenchmarkArtifactStore) -> Mapping[str, object
             measured_known_pilot_cost_microusd if token_telemetry_complete else None
         ),
         "projected_remaining_cost_microusd": (
-            project(measured_known_pilot_cost_microusd)
-            if token_telemetry_complete
-            else None
+            project(measured_known_pilot_cost_microusd) if token_telemetry_complete else None
         ),
         "estimated_cost_state": (
             "available_pilot_scaled_estimate"

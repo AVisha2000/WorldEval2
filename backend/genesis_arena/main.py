@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
 from .arena.simulation_jobs import (
@@ -23,6 +23,9 @@ from .embodiment.api import router as embodiment_router
 from .embodiment.crossroads_conquest import CachedCrossroadsShowcase, CrossroadsShowcaseError
 from .embodiment.dashboard import mount_built_dashboard
 from .embodiment.duel.live_runtime import default_duel_series_service
+from .embodiment.lab.service import LabRunService
+from .embodiment.lab_api import public_router as public_lab_router
+from .embodiment.lab_api import router as lab_router
 from .embodiment.labyrinth_run import CachedLabyrinthRun
 from .embodiment.live_runtime import default_episode_service
 from .embodiment.presentation.preview_ingress import (
@@ -34,6 +37,12 @@ from .embodiment.rts_showcase import CachedRtsShowcase
 from .embodiment.solo_showcase import CachedSoloShowcase
 from .embodiment.transport import ManagedWebSocketEndpoint
 from .embodiment.trio_games.live_runtime import default_trio_series_service
+from .lab_auth import LabAuthService, LabAuthSettings
+from .lab_auth_api import (
+    create_lab_auth_router,
+    create_lab_operator_requirement,
+    install_lab_auth_exception_handlers,
+)
 from .models import Observation, SimulationConfig
 from .orchestrator import Orchestrator
 
@@ -52,9 +61,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.embodiment_gateway = ManagedWebSocketEndpoint()
     app.state.embodiment_preview_ingress = InternalParticipantPreviewIngress()
-    app.state.embodiment_readiness = PilotReadinessStore(
-        settings.embodiment_readiness_path
-    )
+    app.state.embodiment_readiness = PilotReadinessStore(settings.embodiment_readiness_path)
     # A checked-in authority-verified replay/video is reused for the prominent judge path.
     # Starting a dashboard session therefore never spends time or resources re-running the demo.
     app.state.embodiment_rts_showcase = CachedRtsShowcase.load(REPOSITORY_ROOT)
@@ -112,9 +119,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             ffmpeg_executable=settings.ffmpeg_executable,
         )
     )
+    # Lab records own only safe contracts/projections.  The live authority remains responsible
+    # for provider credentials and private controller state.
+    app.state.lab_runs = LabRunService(
+        runs_dir=settings.runs_dir,
+        live_labyrinth=app.state.embodiment_live_labyrinth,
+    )
+    # The Lab has an explicit loopback-only local mode for the desktop launcher
+    # and fails closed if a production magic-link configuration is incomplete.
+    # No provider credential is ever part of this identity state.
+    app.state.lab_auth = LabAuthService(LabAuthSettings.from_environ())
     try:
         yield
     finally:
+        app.state.lab_auth.close()
         await app.state.embodiment_trio_series.aclose()
         await app.state.embodiment_series.aclose()
         await app.state.embodiment_episodes.aclose()
@@ -130,8 +148,24 @@ app = FastAPI(
     ),
     lifespan=lifespan,
 )
+
+
+def _lab_auth_service(request: Request) -> LabAuthService:
+    service = getattr(request.app.state, "lab_auth", None)
+    if not isinstance(service, LabAuthService):
+        raise RuntimeError("Lab authentication is not configured")
+    return service
+
+
+install_lab_auth_exception_handlers(app)
+app.include_router(create_lab_auth_router(_lab_auth_service))
 app.include_router(duel_router)
 app.include_router(embodiment_router)
+app.include_router(
+    lab_router,
+    dependencies=[Depends(create_lab_operator_requirement(_lab_auth_service))],
+)
+app.include_router(public_lab_router)
 app.include_router(internal_preview_router)
 
 

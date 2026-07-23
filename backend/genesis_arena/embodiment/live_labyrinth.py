@@ -13,12 +13,14 @@ import hashlib
 import re
 import secrets
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
     Any,
     Awaitable,
     Callable,
+    Deque,
     Literal,
     Mapping,
     Protocol,
@@ -51,6 +53,13 @@ MAX_LIVE_PROVIDER_CALLS = 450
 DEFAULT_VISION_RANGE_CELLS = 4
 MAX_FINITE_VISION_RANGE_CELLS = 128
 MAX_CORRIDOR_COMMAND_CELLS = 256
+# This is a transient spectator convenience buffer, not replay authority.  It is deliberately
+# bounded so a slow browser cannot turn a long-running provider episode into unbounded memory.
+MAX_LIVE_SPECTATOR_FRAMES = 128
+# Every buffered frame carries a recent visual trail only.  The sealed replay is the durable
+# source of the full route, so keeping an unbounded cumulative visit list in every live frame
+# would defeat the frame-buffer cap when corridor commands traverse large distances.
+MAX_LIVE_SPECTATOR_PATH_CELLS = 512
 _PROVIDER_TIMEOUT_NS = 45 * 1_000_000_000
 LABYRINTH_PROTOCOL_PROMPT = (
     "You control one racer in a private maze lane. Return exactly the MazeTaskPlan JSON object. "
@@ -226,8 +235,8 @@ def validate_maze_skill_text(value: object) -> str:
 
 
 def maze_navigation_skill_sha256(skill_text: str | None = None) -> str:
-    normalized = load_maze_navigation_skill() if skill_text is None else validate_maze_skill_text(
-        skill_text
+    normalized = (
+        load_maze_navigation_skill() if skill_text is None else validate_maze_skill_text(skill_text)
     )
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
@@ -247,13 +256,13 @@ def compose_labyrinth_system_prompt(
         return LABYRINTH_PROTOCOL_PROMPT
     if skill_mode != MAZE_NAVIGATION_SKILL_ID:
         raise ValueError("live maze skill mode is invalid")
-    normalized = load_maze_navigation_skill() if skill_text is None else validate_maze_skill_text(
-        skill_text
+    normalized = (
+        load_maze_navigation_skill() if skill_text is None else validate_maze_skill_text(skill_text)
     )
     digest = maze_navigation_skill_sha256(normalized)
     return (
         f"{LABYRINTH_PROTOCOL_PROMPT}\n\n"
-        f"<skill id=\"{MAZE_NAVIGATION_SKILL_ID}\" sha256=\"{digest}\">\n"
+        f'<skill id="{MAZE_NAVIGATION_SKILL_ID}" sha256="{digest}">\n'
         f"{normalized}\n</skill>"
     )
 
@@ -485,11 +494,7 @@ class MazeNavigationMemory:
     @property
     def traversed_positions(self) -> tuple[tuple[int, int], ...]:
         return tuple(
-            sorted(
-                position
-                for position, cell in self._cells.items()
-                if cell.traversed_mask != 0
-            )
+            sorted(position for position, cell in self._cells.items() if cell.traversed_mask != 0)
         )
 
     def observe(
@@ -565,15 +570,23 @@ class MazeNavigationMemory:
             if self._forced_backtrack is not None and target == self._forced_backtrack:
                 self._route.pop()
                 self._forced_backtrack = None
-            elif len(self._route) > 1 and target == self._route[-2]:
-                self._route.pop()
-            elif target_was_traversed:
-                # A reconverging edge is not allowed to replace the DFS tree parent.  Retain a
-                # temporary duplicate node and force the next accepted move back to its source.
-                self._route.append(target)
-                self._forced_backtrack = source
             else:
-                self._route.append(target)
+                # A loop recovery hint is advisory to the controller, not a movement lock.  A
+                # model can still make another legal accepted move.  In that case, retaining
+                # the old source as a forced parent corrupts the next memory snapshot because
+                # it is no longer adjacent to the pose.  Abandon the stale hint and rebuild
+                # the DFS route from the newly accepted edge instead.
+                self._forced_backtrack = None
+                if len(self._route) > 1 and target == self._route[-2]:
+                    self._route.pop()
+                elif target_was_traversed:
+                    # A reconverging edge is not allowed to replace the DFS tree parent.  Retain
+                    # a temporary duplicate node and suggest the next accepted move return to
+                    # its source.
+                    self._route.append(target)
+                    self._forced_backtrack = source
+                else:
+                    self._route.append(target)
         self._last = (choice, outcome)
 
     def close(self) -> None:
@@ -586,9 +599,7 @@ class MazeNavigationMemory:
     def _snapshot(self, observation_seq: int) -> dict[str, Any]:
         current = self._cells[self._position]
         untried_mask = (
-            0
-            if self._forced_backtrack is not None
-            else current.open_mask & ~current.traversed_mask
+            0 if self._forced_backtrack is not None else current.open_mask & ~current.traversed_mask
         )
         backtrack = None
         parent = self._forced_backtrack
@@ -620,10 +631,7 @@ class MazeNavigationMemory:
             key=lambda position: (
                 position != self._position,
                 position not in route_set,
-                not bool(
-                    self._cells[position].open_mask
-                    & ~self._cells[position].traversed_mask
-                ),
+                not bool(self._cells[position].open_mask & ~self._cells[position].traversed_mask),
                 -self._cells[position].seen_seq,
                 position,
             ),
@@ -909,6 +917,7 @@ async def run_live_labyrinth_race(
     skill_mode: SkillMode = "none",
     skill_text: str | None = None,
     cancel_event: asyncio.Event | None = None,
+    public_observer: Callable[[Mapping[str, object]], None] | None = None,
     _benchmark_fail_fast: bool = False,
 ) -> LiveMazeRaceExecution:
     """Run a simultaneous, input-responsive race with exactly three isolated controllers.
@@ -1187,6 +1196,45 @@ async def run_live_labyrinth_race(
                     )
                 )
                 racer.observation_seq += 1
+            if public_observer is not None:
+                public_observer(
+                    {
+                        "schema_version": "worldarena/live-labyrinth-observer/1",
+                        "status": "running",
+                        "tick": tick,
+                        "provider_calls": calls,
+                        "map": {
+                            "map_id": normalized_map.map_id,
+                            "map_sha256": normalized_map.map_sha256,
+                            "rows": list(normalized_map.rows),
+                            "start": list(normalized_map.start),
+                            "exit": list(normalized_map.exit),
+                        },
+                        "racers": [
+                            {
+                                **racer.entrant.public_dict(),
+                                "position": list(racer.position),
+                                "path": [
+                                    list(cell)
+                                    for cell in racer.visits[-MAX_LIVE_SPECTATOR_PATH_CELLS:]
+                                ],
+                                # This is a renderer-derived field-of-view overlay, not the
+                                # participant's raw request payload.  It lets the authenticated
+                                # Lab show exactly what each racer could see without exposing
+                                # navigation memory, prompts, or private model material.
+                                "visible_cells": [
+                                    list(cell)
+                                    for cell in maze_visible_cells(
+                                        racer.position, vision_range_cells, normalized_map
+                                    )
+                                ],
+                                "provider_calls": racer.provider_calls,
+                                "finished": racer.finished_tick is not None,
+                            }
+                            for racer in racers
+                        ],
+                    }
+                )
     finally:
         # The objects held in `protected` retain snapshots for internal evidence only; every live
         # mutable controller scratchpad and navigation memory is erased at the episode boundary.
@@ -1235,6 +1283,7 @@ async def run_benchmark_labyrinth_race(
     vision_range_cells: VisionRange = DEFAULT_VISION_RANGE_CELLS,
     skill_text: str | None = None,
     cancel_event: asyncio.Event | None = None,
+    public_observer: Callable[[Mapping[str, object]], None] | None = None,
 ) -> LiveMazeRaceExecution:
     """Benchmark-facing entry point with no legacy competition-wide budget semantics."""
 
@@ -1248,6 +1297,7 @@ async def run_benchmark_labyrinth_race(
         skill_mode="none" if skill_text is None else MAZE_NAVIGATION_SKILL_ID,
         skill_text=skill_text,
         cancel_event=cancel_event,
+        public_observer=public_observer,
         _benchmark_fail_fast=True,
     )
 
@@ -1472,8 +1522,7 @@ def verify_live_replay(replay: Mapping[str, Any]) -> None:
         (dict(value) for value in events),
         key=lambda value: (
             value.get("tick", -1)
-            if isinstance(value.get("tick"), int)
-            and not isinstance(value.get("tick"), bool)
+            if isinstance(value.get("tick"), int) and not isinstance(value.get("tick"), bool)
             else -1,
             str(value.get("participant_id", "")),
             str(value.get("kind", "")),
@@ -1587,9 +1636,7 @@ def verify_live_replay(replay: Mapping[str, Any]) -> None:
         participant_events = events_by_participant[participant_id]
         move_events = [value for value in participant_events if value["kind"] == "move"]
         passive_events = [
-            value
-            for value in participant_events
-            if value["kind"] not in {"move", "finish"}
+            value for value in participant_events if value["kind"] not in {"move", "finish"}
         ]
         finish_events = [value for value in participant_events if value["kind"] == "finish"]
         expected_choices = []
@@ -1607,10 +1654,7 @@ def verify_live_replay(replay: Mapping[str, Any]) -> None:
                 for source, target in zip(move_ticks, move_ticks[1:])
             )
             or len(passive_events) != racer["waiting_windows"]
-            or sum(
-                value["kind"] in {"invalid", "provider_failure"}
-                for value in passive_events
-            )
+            or sum(value["kind"] in {"invalid", "provider_failure"} for value in passive_events)
             != racer["invalid_decisions"]
         ):
             raise LiveLabyrinthError("live labyrinth event timeline differs")
@@ -1636,8 +1680,7 @@ def verify_live_replay(replay: Mapping[str, Any]) -> None:
         participant_id: index + 1 for index, participant_id in enumerate(finish_order)
     }
     if any(
-        racer.get("place") != expected_places.get(racer.get("participant_id"))
-        for racer in racers
+        racer.get("place") != expected_places.get(racer.get("participant_id")) for racer in racers
     ):
         raise LiveLabyrinthError("live labyrinth placements differ")
     expected_result = {
@@ -1690,6 +1733,189 @@ class _ServiceRecord:
     video_state: str = "unavailable"
     video_path: Path | None = None
     video_error: str | None = None
+    observer_frame: dict[str, Any] | None = None
+    observer_frame_sequence: int = 0
+    observer_frames: Deque[tuple[int, dict[str, Any]]] = field(default_factory=deque)
+
+
+_LIVE_OBSERVER_SCHEMA = "worldarena/live-labyrinth-observer/1"
+_LIVE_OBSERVER_FIELDS = frozenset(
+    {"schema_version", "status", "tick", "provider_calls", "map", "racers"}
+)
+_LIVE_OBSERVER_MAP_FIELDS = frozenset({"map_id", "map_sha256", "rows", "start", "exit"})
+_LIVE_OBSERVER_RACER_FIELDS = frozenset(
+    {
+        "participant_id",
+        "entrant_id",
+        "display_name",
+        "provider",
+        "model",
+        "color",
+        "position",
+        "path",
+        "visible_cells",
+        "provider_calls",
+        "finished",
+    }
+)
+
+
+def _observer_cell(value: object, *, graph: Mapping[tuple[int, int], object]) -> list[int]:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes))
+        or len(value) != 2
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in value)
+    ):
+        raise LiveLabyrinthError("live labyrinth observer cell is invalid")
+    cell = (int(value[0]), int(value[1]))
+    if cell not in graph:
+        raise LiveLabyrinthError("live labyrinth observer cell is outside the map")
+    return [cell[0], cell[1]]
+
+
+def _normalise_observer_frame(record: _ServiceRecord, value: object) -> dict[str, Any]:
+    """Copy only the deterministic observer surface produced by the authority.
+
+    The callback is intentionally treated as an untrusted boundary even though it is currently
+    internal.  This keeps a future renderer or transport refactor from accidentally turning a
+    private provider field into a browser-visible one.
+    """
+
+    if not isinstance(value, Mapping) or set(value) != _LIVE_OBSERVER_FIELDS:
+        raise LiveLabyrinthError("live labyrinth observer fields are invalid")
+    if value.get("schema_version") != _LIVE_OBSERVER_SCHEMA:
+        raise LiveLabyrinthError("live labyrinth observer schema is invalid")
+    status = value.get("status")
+    tick = value.get("tick")
+    provider_calls = value.get("provider_calls")
+    if (
+        status not in {"queued", "running"}
+        or isinstance(tick, bool)
+        or not isinstance(tick, int)
+        or tick < 0
+        or isinstance(provider_calls, bool)
+        or not isinstance(provider_calls, int)
+        or provider_calls < 0
+    ):
+        raise LiveLabyrinthError("live labyrinth observer lifecycle is invalid")
+
+    graph = record.map_spec.graph()
+    map_value = value.get("map")
+    if not isinstance(map_value, Mapping) or set(map_value) != _LIVE_OBSERVER_MAP_FIELDS:
+        raise LiveLabyrinthError("live labyrinth observer map is invalid")
+    expected_map = {
+        "map_id": record.map_spec.map_id,
+        "map_sha256": record.map_spec.map_sha256,
+        "rows": list(record.map_spec.rows),
+        "start": list(record.map_spec.start),
+        "exit": list(record.map_spec.exit),
+    }
+    if dict(map_value) != expected_map:
+        raise LiveLabyrinthError("live labyrinth observer map differs from authority")
+
+    racers = value.get("racers")
+    if not isinstance(racers, list) or len(racers) != len(record.entrants):
+        raise LiveLabyrinthError("live labyrinth observer racers are invalid")
+    safe_racers: list[dict[str, Any]] = []
+    calls_by_racer = 0
+    maximum_path_cells = min(
+        record.participant_call_budget * MAX_CORRIDOR_COMMAND_CELLS + 1,
+        MAX_LIVE_SPECTATOR_PATH_CELLS,
+    )
+    for raw_racer, entrant in zip(racers, record.entrants):
+        if not isinstance(raw_racer, Mapping) or set(raw_racer) != _LIVE_OBSERVER_RACER_FIELDS:
+            raise LiveLabyrinthError("live labyrinth observer racer fields are invalid")
+        expected_entrant = entrant.public_dict()
+        if any(raw_racer.get(key) != item for key, item in expected_entrant.items()):
+            raise LiveLabyrinthError("live labyrinth observer entrant differs")
+        position = _observer_cell(raw_racer.get("position"), graph=graph)
+        raw_path = raw_racer.get("path")
+        raw_visible_cells = raw_racer.get("visible_cells")
+        if (
+            not isinstance(raw_path, list)
+            or not raw_path
+            or len(raw_path) > maximum_path_cells
+            or not isinstance(raw_visible_cells, list)
+            or len(raw_visible_cells) > len(graph)
+        ):
+            raise LiveLabyrinthError("live labyrinth observer geometry is invalid")
+        path = [_observer_cell(cell, graph=graph) for cell in raw_path]
+        visible_cells = [_observer_cell(cell, graph=graph) for cell in raw_visible_cells]
+        racer_calls = raw_racer.get("provider_calls")
+        finished = raw_racer.get("finished")
+        if (
+            path[-1] != position
+            or isinstance(racer_calls, bool)
+            or not isinstance(racer_calls, int)
+            or not 0 <= racer_calls <= record.participant_call_budget
+            or not isinstance(finished, bool)
+        ):
+            raise LiveLabyrinthError("live labyrinth observer racer state is invalid")
+        calls_by_racer += racer_calls
+        # Provider/model strings are checked for consistency above but deliberately omitted from
+        # the live spectator frame.  The immutable run contract already carries model identity.
+        safe_racers.append(
+            {
+                "participant_id": entrant.participant_id,
+                "entrant_id": entrant.entrant_id,
+                "display_name": entrant.display_name,
+                "color": entrant.color,
+                "position": position,
+                "path": path,
+                "visible_cells": visible_cells,
+                "provider_calls": racer_calls,
+                "finished": finished,
+            }
+        )
+    if provider_calls != calls_by_racer:
+        raise LiveLabyrinthError("live labyrinth observer call count differs")
+    return {
+        "schema_version": _LIVE_OBSERVER_SCHEMA,
+        "status": status,
+        "tick": tick,
+        "provider_calls": provider_calls,
+        "map": expected_map,
+        "racers": safe_racers,
+    }
+
+
+def _initial_observer_frame(record: _ServiceRecord, *, status: str) -> dict[str, Any]:
+    start = list(record.map_spec.start)
+    return _normalise_observer_frame(
+        record,
+        {
+            "schema_version": _LIVE_OBSERVER_SCHEMA,
+            "status": status,
+            "tick": 0,
+            "provider_calls": 0,
+            "map": {
+                "map_id": record.map_spec.map_id,
+                "map_sha256": record.map_spec.map_sha256,
+                "rows": list(record.map_spec.rows),
+                "start": start,
+                "exit": list(record.map_spec.exit),
+            },
+            "racers": [
+                {
+                    **entrant.public_dict(),
+                    "position": start,
+                    "path": [start],
+                    "visible_cells": [
+                        list(cell)
+                        for cell in maze_visible_cells(
+                            record.map_spec.start,
+                            record.vision_range_cells,
+                            record.map_spec,
+                        )
+                    ],
+                    "provider_calls": 0,
+                    "finished": False,
+                }
+                for entrant in record.entrants
+            ],
+        },
+    )
 
 
 class LiveLabyrinthService:
@@ -1746,6 +1972,7 @@ class LiveLabyrinthService:
             participant_call_budget=effective_budget,
             skill_mode=skill_mode,
         )
+        self._store_observer_frame(record, _initial_observer_frame(record, status="queued"))
         async with self._lock:
             self._records[episode_id] = record
             record.task = asyncio.create_task(
@@ -1780,6 +2007,7 @@ class LiveLabyrinthService:
         cleanup: Callable[[], Awaitable[None]] | None,
     ) -> None:
         record.state = "running"
+        self._store_observer_frame(record, _initial_observer_frame(record, status="running"))
         try:
             record.execution = await run_live_labyrinth_race(
                 episode_id=episode_id,
@@ -1792,6 +2020,7 @@ class LiveLabyrinthService:
                 skill_mode=skill_mode,
                 skill_text=skill_text,
                 cancel_event=record.cancel_event,
+                public_observer=lambda snapshot: self._capture_observer_frame(record, snapshot),
             )
             provider_failures = [
                 decision.provider_failure
@@ -1804,6 +2033,7 @@ class LiveLabyrinthService:
                 record.state = "failed"
                 record.failure = _live_provider_failure_code(provider_failures)
                 return
+            self._capture_terminal_observer_frame(record)
             record.state = "completed"
             if self._render_video is not None:
                 record.video_state = "saving"
@@ -1868,6 +2098,178 @@ class LiveLabyrinthService:
     async def video_path(self, episode_id: str) -> Path | None:
         return (await self._record(episode_id)).video_path
 
+    async def observer(self, episode_id: str) -> Mapping[str, Any] | None:
+        """Return the latest allow-listed authority frame for an authenticated spectator.
+
+        This is deliberately a snapshot, not a control channel or a provider-request mirror. A
+        caller receives only public spatial geometry, renderer-derived sightlines, and numeric
+        call counts. The current decision window remains private to the authority.
+        """
+
+        frame = (await self._record(episode_id)).observer_frame
+        if frame is None:
+            return None
+        copied = strict_json_loads(canonical_json_bytes(frame))
+        if not isinstance(copied, Mapping):  # Defensive canonical-copy assertion.
+            raise LiveLabyrinthError("live labyrinth observer frame is invalid")
+        return copied
+
+    async def spectator_frames(
+        self, episode_id: str, *, after_sequence: int = 0
+    ) -> Mapping[str, Any]:
+        """Return a bounded cursor feed of already-safe observer frames.
+
+        This is presentation data only.  It contains the same allow-listed v1 frames returned by
+        :meth:`observer`, lets a browser replay every recent decision window, and deliberately
+        exposes neither an episode identifier nor a control channel in its returned body.
+        """
+
+        if (
+            isinstance(after_sequence, bool)
+            or not isinstance(after_sequence, int)
+            or after_sequence < 0
+        ):
+            raise ValueError("live labyrinth spectator cursor is invalid")
+        record = await self._record(episode_id)
+        retained = tuple(record.observer_frames)
+        cursor = record.observer_frame_sequence
+        if not retained:
+            body: Mapping[str, object] = {
+                "cursor": cursor,
+                "reset_required": False,
+                "frames": [],
+            }
+        else:
+            oldest_sequence = retained[0][0]
+            reset_required = after_sequence < oldest_sequence - 1
+            selected = (
+                retained[-1:]
+                if reset_required
+                else tuple(item for item in retained if item[0] > after_sequence)
+            )
+            body = {
+                "cursor": cursor,
+                "reset_required": reset_required,
+                "frames": [{"sequence": sequence, "frame": frame} for sequence, frame in selected],
+            }
+        copied = strict_json_loads(canonical_json_bytes(body))
+        if not isinstance(copied, Mapping):  # Defensive canonical-copy assertion.
+            raise LiveLabyrinthError("live labyrinth spectator feed is invalid")
+        return copied
+
+    @staticmethod
+    def _store_observer_frame(record: _ServiceRecord, frame: Mapping[str, object]) -> None:
+        """Append an already-normalized observer frame as an independent bounded snapshot."""
+
+        copied = strict_json_loads(canonical_json_bytes(frame))
+        if not isinstance(copied, dict):  # Defensive canonical-copy assertion.
+            raise LiveLabyrinthError("live labyrinth observer frame is invalid")
+        record.observer_frame_sequence += 1
+        record.observer_frame = copied
+        record.observer_frames.append((record.observer_frame_sequence, copied))
+        while len(record.observer_frames) > MAX_LIVE_SPECTATOR_FRAMES:
+            record.observer_frames.popleft()
+
+    @classmethod
+    def _capture_terminal_observer_frame(cls, record: _ServiceRecord) -> None:
+        """Retain the exact final spatial state before the lifecycle becomes terminal.
+
+        Observer v1 intentionally represents only queued/running frames, so terminal lifecycle
+        remains available through ``status`` / the Lab run record.  The last v1 snapshot is still
+        useful to a browser as the final authority position while the sealed replay/video arrives.
+        """
+
+        execution = record.execution
+        if execution is None:
+            return
+        try:
+            replay = execution.replay
+            racers = replay.get("racers") if isinstance(replay, Mapping) else None
+            if not isinstance(racers, list):
+                return
+            by_participant = {
+                racer.get("participant_id"): racer for racer in racers if isinstance(racer, Mapping)
+            }
+            if set(by_participant) != {entrant.participant_id for entrant in record.entrants}:
+                return
+            tick = replay.get("elapsed_ticks")
+            calls = replay.get("provider_calls")
+            if (
+                isinstance(tick, bool)
+                or not isinstance(tick, int)
+                or tick < 0
+                or isinstance(calls, bool)
+                or not isinstance(calls, int)
+                or calls < 0
+            ):
+                return
+            raw_racers = []
+            for entrant in record.entrants:
+                racer = by_participant[entrant.participant_id]
+                position = racer.get("final_cell")
+                path = racer.get("path")
+                provider_calls = racer.get("provider_calls")
+                finished = racer.get("finished")
+                if (
+                    not isinstance(position, list)
+                    or not isinstance(path, list)
+                    or isinstance(provider_calls, bool)
+                    or not isinstance(provider_calls, int)
+                    or not isinstance(finished, bool)
+                ):
+                    return
+                raw_racers.append(
+                    {
+                        **entrant.public_dict(),
+                        "position": position,
+                        "path": path[-MAX_LIVE_SPECTATOR_PATH_CELLS:],
+                        "visible_cells": [
+                            list(cell)
+                            for cell in maze_visible_cells(
+                                (position[0], position[1]),
+                                record.vision_range_cells,
+                                record.map_spec,
+                            )
+                        ],
+                        "provider_calls": provider_calls,
+                        "finished": finished,
+                    }
+                )
+            cls._store_observer_frame(
+                record,
+                _normalise_observer_frame(
+                    record,
+                    {
+                        "schema_version": _LIVE_OBSERVER_SCHEMA,
+                        "status": "running",
+                        "tick": tick,
+                        "provider_calls": calls,
+                        "map": {
+                            "map_id": record.map_spec.map_id,
+                            "map_sha256": record.map_spec.map_sha256,
+                            "rows": list(record.map_spec.rows),
+                            "start": list(record.map_spec.start),
+                            "exit": list(record.map_spec.exit),
+                        },
+                        "racers": raw_racers,
+                    },
+                ),
+            )
+        except (IndexError, KeyError, TypeError, ValueError, LiveLabyrinthError):
+            # Spectator preparation must never alter a valid authoritative result.
+            return
+
+    @classmethod
+    def _capture_observer_frame(
+        cls, record: _ServiceRecord, snapshot: Mapping[str, object]
+    ) -> None:
+        try:
+            cls._store_observer_frame(record, _normalise_observer_frame(record, snapshot))
+        except Exception:
+            # A spectator projection must never be able to alter race authority. Keep the last
+            # known-safe frame rather than surfacing an unchecked replacement or failing a race.
+            return
+
     async def _record(self, episode_id: str) -> _ServiceRecord:
         async with self._lock:
             try:
@@ -1895,6 +2297,10 @@ class LiveLabyrinthService:
             "participant_call_budget": record.participant_call_budget,
             "skill_mode": record.skill_mode,
             "video": {"state": record.video_state},
+            "observer": {
+                "available": record.observer_frame is not None,
+                "tick": record.observer_frame["tick"] if record.observer_frame else None,
+            },
         }
 
 
@@ -1919,6 +2325,8 @@ __all__ = [
     "MAZE_NAVIGATION_SKILL_ID",
     "MAZE_NAVIGATION_SKILL_PATH",
     "MAX_LIVE_PROVIDER_CALLS",
+    "MAX_LIVE_SPECTATOR_FRAMES",
+    "MAX_LIVE_SPECTATOR_PATH_CELLS",
     "DEFAULT_VISION_RANGE_CELLS",
     "MAX_FINITE_VISION_RANGE_CELLS",
     "LiveLabyrinthError",
